@@ -36,6 +36,7 @@ from .core import (
     Era,
     FolkloreItem,
     Law,
+    LawConflict,
     LawRevision,
     LawRevisionStatus,
     LawStatus,
@@ -205,28 +206,14 @@ class TurnEngine:
             snap = TurnLawSnapshot(turn_id=turn.id, civilization_id=civ_id)
             laws = self.store.laws_of(civ_id)
 
+            # Pass 1: classify every law into the snapshot buckets first, so
+            # that conflict detection (§13 step 13) sees the COMPLETE final
+            # active set — including laws whose own revisions are processed
+            # later in the iteration order (§4.3).
             for law in laws:
                 winner = winners.get(law.id)
-                if winner is not None:
-                    winner.cost = cost_of_law_change(
-                        law, winner.action, cfg=self.pricing_cfg,
-                        scope_delta=len(winner.raw_text) / 500.0,
-                    )
-                    self.store.mark_included(winner.id, turn.id)
-                    if winner.action in (LawUserAction.REPEAL_LAW,):
-                        snap.pending_repeals.append(winner)
-                    elif winner.action == LawUserAction.SUSPEND_LAW:
-                        snap.suspended_laws.append(law.id)
-                        snap.pending_amendments.append(winner)
-                    else:
-                        snap.pending_amendments.append(winner)
-                # A law whose winning revision suspends or repeals it in this
-                # turn is no longer part of the *active* set (§4.3), even
-                # though its stored status updates only at application time.
                 winner_action = winner.action if winner is not None else None
-                if winner_action == LawUserAction.SUSPEND_LAW:
-                    pass  # already recorded in snap.suspended_laws above
-                elif winner_action == LawUserAction.REPEAL_LAW:
+                if winner_action == LawUserAction.REPEAL_LAW:
                     pass  # recorded in snap.pending_repeals; not active anymore
                 elif law.status == LawStatus.ACTIVE:
                     snap.active_laws.append(law)
@@ -237,6 +224,30 @@ class TurnEngine:
                         CustomaryLaw(id=law.id, civilization_id=civ_id,
                                      title=law.title, strength=min(law.tradition, 1.0))
                     )
+
+            # Pass 2: price and attach each law's winning revision.
+            for law in laws:
+                winner = winners.get(law.id)
+                if winner is None:
+                    continue
+                # §13 step 13 (norm-conflict detection) feeds the §5.1
+                # contradiction_penalty term of the price shown to the
+                # player *before* submission (§16: "показывать стоимость").
+                contradictions = self._count_conflicts(law, snap, civ_id)
+                winner.cost = cost_of_law_change(
+                    law, winner.action, cfg=self.pricing_cfg,
+                    scope_delta=len(winner.raw_text) / 500.0,
+                    contradictions=contradictions,
+                )
+                self.store.mark_included(winner.id, turn.id)
+                if winner.action in (LawUserAction.REPEAL_LAW,):
+                    snap.pending_repeals.append(winner)
+                elif winner.action == LawUserAction.SUSPEND_LAW:
+                    if law.id not in snap.suspended_laws:
+                        snap.suspended_laws.append(law.id)
+                    snap.pending_amendments.append(winner)
+                else:
+                    snap.pending_amendments.append(winner)
             snapshots.append(snap)
 
         turn.status = TurnStatus.SNAPSHOT_PREPARED
@@ -351,8 +362,12 @@ class TurnEngine:
                 continue
             budget = economy[snap.civilization_id]["production"] + civ.administrative_budget
             for rev in snap.pending_amendments + snap.pending_repeals:
-                law = self.store.get_law(rev.law_id)
-                c = cost_of_law_change(law, rev.action, cfg=self.pricing_cfg)
+                # Charge the EXACT price computed at snapshot time (§5.1):
+                # same inputs (law state, scope_delta, detected norm
+                # conflicts) as the preview shown to the player before
+                # submission — no drift between preview and charge.
+                c = rev.cost if rev.cost is not None else cost_of_law_change(
+                    self.store.get_law(rev.law_id), rev.action, cfg=self.pricing_cfg)
                 budget -= c
                 admin_costs.setdefault(snap.civilization_id, 0.0)
                 admin_costs[snap.civilization_id] += c
@@ -404,6 +419,35 @@ class TurnEngine:
         )
 
     # ------------------------------------------------------------- internals
+
+    def _count_conflicts(self, law, snap: TurnLawSnapshot, civ_id: str) -> int:
+        """§13 step 13 (norm-conflict detection), used for §5 pricing.
+
+        A revision that contradicts other active laws of the same civ or
+        surviving customary remnants pays ``contradiction_penalty`` per
+        conflict (§5.1). Deterministic and independent of wall-clock time.
+        Detected conflicts are also recorded on the snapshot (§4.3
+        ``conflicts``) so clients can display them (§16.2).
+        """
+        count = 0
+        for other in snap.active_laws:
+            if other.id == law.id:
+                continue
+            if (other.canonical is not None and law.canonical is not None
+                    and other.canonical.kind == law.canonical.kind):
+                count += 1
+                snap.conflicts.append(
+                    LawConflict(law_a=law.id, law_b=other.id,
+                                description="two active laws of the same kind")
+                )
+        for rem in snap.customary_remnants:
+            if rem.title == law.title:
+                count += 1
+                snap.conflicts.append(
+                    LawConflict(law_a=law.id, law_b=None, folklore_ref=rem.title,
+                                description="law contradicts a customary remnant")
+                )
+        return count
 
     def _apply_snapshot_changes(self, snap: TurnLawSnapshot, applied: list[str]) -> None:
         for rev in snap.pending_amendments + snap.pending_repeals:

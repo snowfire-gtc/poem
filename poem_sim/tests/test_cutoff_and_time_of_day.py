@@ -238,10 +238,12 @@ def test_law_change_cost_is_charged_from_admin_budget_in_turn():
                                new_canonical=CanonicalLaw(kind="tax")),
             now=DAY.replace(hour=hour))
         engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+        snaps = engine.prepare_snapshot()
+        # The charge equals the snapshot-time preview price (§5.1), including
+        # the actual change volume (scope_delta) — identical for both hours.
+        expected = store.get_revision(rev.id).cost
         report = engine.run_turn()
         assert rev.id in report.applied_revisions
-        expected = cost_of_law_change(store.get_law("law-tax"),
-                                      LawUserAction.AMEND_LAW, cfg=PricingConfig())
         assert report.admin_costs["c1"] == pytest.approx(expected)
         assert civ.administrative_budget == pytest.approx(2500.0 - expected)
         costs_by_hour[hour] = (report.admin_costs["c1"],
@@ -270,5 +272,82 @@ def test_deferred_revision_not_charged_until_applied():
     report2 = engine.run_turn()
     assert late.id in report2.applied_revisions
     repeal_cost = cost_of_law_change(store.get_law("law-tax"),
-                                     LawUserAction.REPEAL_LAW, cfg=PricingConfig())
+                                     LawUserAction.REPEAL_LAW, cfg=PricingConfig(),
+                                     scope_delta=len(late.raw_text) / 500.0)
     assert report2.admin_costs["c1"] == pytest.approx(repeal_cost)
+
+
+# ---------------------------------------------------------------------------
+# §13 step 13 + §5.1 — конфликты норм влияют на стоимость и видны в снимке
+# ---------------------------------------------------------------------------
+
+def test_norm_conflict_raises_revision_cost_and_is_recorded_in_snapshot():
+    """Amending a law that conflicts with another active law of the same kind
+    pays contradiction_penalty (§5.1) and the conflict appears in the
+    TurnLawSnapshot.conflicts for client display (§4.3, §16.2)."""
+    store = LawStore()
+    civ = Civilization(id="c1", name="Rivers", progress=0.25)
+    store.add_law(Law(
+        id="law-tax-a", civilization_id="c1", title="Head tax",
+        raw_text="Every settlement pays 1 unit per hearth.",
+        canonical=CanonicalLaw(kind="tax"), complexity=1.5, tradition=0.2))
+    store.add_law(Law(
+        id="law-tax-b", civilization_id="c1", title="Hearth tax",
+        raw_text="Every hearth pays grain.",
+        canonical=CanonicalLaw(kind="tax"), complexity=1.0, tradition=0.1))
+    chrono = WorldChronology("w1")
+    engine = TurnEngine("w1", store, chrono, [civ])
+
+    rev = store.record_revision(
+        "law-tax-a", "c1", LawUserAction.AMEND_LAW, "Exempt small settlements.",
+        CanonicalLawChange(action=LawUserAction.AMEND_LAW,
+                           new_canonical=CanonicalLaw(kind="tax")),
+        now=DAY.replace(hour=9))
+
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+    snaps = engine.prepare_snapshot()
+    snap = next(s for s in snaps if s.civilization_id == "c1")
+
+    # one conflicting active law (law-tax-b, same canonical kind "tax")
+    cfg = PricingConfig()
+    base = cost_of_law_change(store.get_law("law-tax-a"),
+                              LawUserAction.AMEND_LAW, cfg=cfg,
+                              scope_delta=len(rev.raw_text) / 500.0)
+    with_conflict = base + cfg.contradiction_penalty * 1
+    assert rev.cost == pytest.approx(with_conflict)
+    assert any(c.law_a == "law-tax-a" and c.law_b == "law-tax-b"
+               for c in snap.conflicts)
+
+    report = engine.run_turn()
+    # the charged admin cost includes the contradiction penalty too
+    assert report.admin_costs["c1"] == pytest.approx(with_conflict)
+
+
+def test_no_conflict_means_no_contradiction_penalty():
+    """Laws of different kinds do not raise the price (§5.1 term is zero)."""
+    store = LawStore()
+    civ = Civilization(id="c1", name="Rivers", progress=0.25)
+    store.add_law(Law(
+        id="law-tax-a", civilization_id="c1", title="Head tax",
+        raw_text="Every settlement pays 1 unit per hearth.",
+        canonical=CanonicalLaw(kind="tax"), complexity=1.5, tradition=0.2))
+    store.add_law(Law(
+        id="law-ban-x", civilization_id="c1", title="Sea ban",
+        raw_text="No fishing beyond the reef.",
+        canonical=CanonicalLaw(kind="ban"), complexity=1.0, tradition=0.1))
+    chrono = WorldChronology("w1")
+    engine = TurnEngine("w1", store, chrono, [civ])
+
+    rev = store.record_revision(
+        "law-tax-a", "c1", LawUserAction.CLARIFY_LAW, "Clarify wording.",
+        CanonicalLawChange(action=LawUserAction.CLARIFY_LAW),
+        now=DAY.replace(hour=9))
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+    snaps = engine.prepare_snapshot()
+    snap = next(s for s in snaps if s.civilization_id == "c1")
+
+    expected = cost_of_law_change(store.get_law("law-tax-a"),
+                                  LawUserAction.CLARIFY_LAW, cfg=PricingConfig(),
+                                  scope_delta=len(rev.raw_text) / 500.0)
+    assert rev.cost == pytest.approx(expected)
+    assert snap.conflicts == []
