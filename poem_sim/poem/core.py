@@ -144,6 +144,21 @@ class CanonicalLaw:
     text_summary: str = ""
 
 
+# Pairs of law kinds that contradict each other when both are active for the
+# same civilization (§13 step 13 — norm-conflict detection). Symmetric.
+CONFLICTING_KINDS: dict[str, set[str]] = {
+    "tax": {"ban"},        # e.g. hearth tax vs. ban on resource extraction
+    "corvee": {"ban"},     # forced labour vs. prohibition of it
+    "levy": {"exemption"}, # conscription vs. blanket exemption
+}
+
+
+def kinds_conflict(kind_a: str, kind_b: str) -> bool:
+    """True if two canonical law kinds contradict each other (§5.1 term)."""
+    return kind_b in CONFLICTING_KINDS.get(kind_a, set()) or \
+        kind_a in CONFLICTING_KINDS.get(kind_b, set())
+
+
 @dataclass
 class CanonicalLawChange:
     """Machine-readable change carried by a revision."""
@@ -152,6 +167,8 @@ class CanonicalLawChange:
     new_canonical: CanonicalLaw | None = None   # for AmendLaw / SubmitDraft path
     suspend_years: float | None = None          # for SuspendLaw
     transition: SimDuration | None = None       # optional transition period
+    urgent: bool = False                        # §5.2 special-resource urgency,
+                                                # NEVER wall-clock time of day
     note: str = ""
 
 

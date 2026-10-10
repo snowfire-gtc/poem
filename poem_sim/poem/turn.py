@@ -233,11 +233,24 @@ class TurnEngine:
                 # §13 step 13 (norm-conflict detection) feeds the §5.1
                 # contradiction_penalty term of the price shown to the
                 # player *before* submission (§16: "показывать стоимость").
-                contradictions = self._count_conflicts(law, snap, civ_id)
+                # The prospective canonical form of the amendment is what
+                # conflicts with the rest of the legal system — if the
+                # revision carries a new canonical, it replaces the old one
+                # for conflict purposes.
+                effective_canonical = (
+                    winner.canonical_change.new_canonical
+                    or law.canonical
+                )
+                contradictions = self._count_conflicts(
+                    law, snap, civ_id, prospective=effective_canonical)
                 winner.cost = cost_of_law_change(
                     law, winner.action, cfg=self.pricing_cfg,
                     scope_delta=len(winner.raw_text) / 500.0,
                     contradictions=contradictions,
+                    transition_years=(
+                        winner.canonical_change.transition.years
+                        if winner.canonical_change.transition else 0.0),
+                    urgent=winner.canonical_change.urgent,
                 )
                 self.store.mark_included(winner.id, turn.id)
                 if winner.action in (LawUserAction.REPEAL_LAW,):
@@ -420,26 +433,42 @@ class TurnEngine:
 
     # ------------------------------------------------------------- internals
 
-    def _count_conflicts(self, law, snap: TurnLawSnapshot, civ_id: str) -> int:
+    def _count_conflicts(
+        self, law, snap: TurnLawSnapshot, civ_id: str, prospective=None
+    ) -> int:
         """§13 step 13 (norm-conflict detection), used for §5 pricing.
 
-        A revision that contradicts other active laws of the same civ or
-        surviving customary remnants pays ``contradiction_penalty`` per
-        conflict (§5.1). Deterministic and independent of wall-clock time.
-        Detected conflicts are also recorded on the snapshot (§4.3
-        ``conflicts``) so clients can display them (§16.2).
+        A revision whose (possibly new) canonical form contradicts another
+        active law of the same civilization or a surviving customary remnant
+        pays ``contradiction_penalty`` per conflict (§5.1). Deterministic and
+        independent of wall-clock time. Detected conflicts are also recorded
+        on the snapshot (§4.3 ``conflicts``) so clients can display them
+        (§16.2).
+
+        Two kinds of contradiction are recognised:
+         * identical canonical kind — two laws regulating the same matter;
+         * conflicting kind pair (``kinds_conflict``, e.g. tax vs ban).
         """
+        from .core import kinds_conflict
+
+        canon = prospective if prospective is not None else law.canonical
         count = 0
         for other in snap.active_laws:
             if other.id == law.id:
                 continue
-            if (other.canonical is not None and law.canonical is not None
-                    and other.canonical.kind == law.canonical.kind):
-                count += 1
-                snap.conflicts.append(
-                    LawConflict(law_a=law.id, law_b=other.id,
-                                description="two active laws of the same kind")
-                )
+            if canon is not None and other.canonical is not None:
+                same_kind = other.canonical.kind == canon.kind
+                opposed = kinds_conflict(canon.kind, other.canonical.kind)
+                if same_kind or opposed:
+                    count += 1
+                    snap.conflicts.append(
+                        LawConflict(law_a=law.id, law_b=other.id,
+                                    description=(
+                                        "two active laws of the same kind"
+                                        if same_kind else
+                                        f"kinds {canon.kind!r} and "
+                                        f"{other.canonical.kind!r} contradict"))
+                    )
         for rem in snap.customary_remnants:
             if rem.title == law.title:
                 count += 1

@@ -18,6 +18,7 @@ from poem.core import (
     Law,
     LawStatus,
     LawUserAction,
+    SimDuration,
 )
 from poem.laws import LawStore
 from poem.pricing import PricingConfig, cost_of_law_change
@@ -324,7 +325,8 @@ def test_norm_conflict_raises_revision_cost_and_is_recorded_in_snapshot():
 
 
 def test_no_conflict_means_no_contradiction_penalty():
-    """Laws of different kinds do not raise the price (§5.1 term is zero)."""
+    """Non-opposing law kinds (festival vs tax: no same-kind, no contradiction
+    pair) do not raise the price (§5.1 contradiction term stays zero)."""
     store = LawStore()
     civ = Civilization(id="c1", name="Rivers", progress=0.25)
     store.add_law(Law(
@@ -332,9 +334,9 @@ def test_no_conflict_means_no_contradiction_penalty():
         raw_text="Every settlement pays 1 unit per hearth.",
         canonical=CanonicalLaw(kind="tax"), complexity=1.5, tradition=0.2))
     store.add_law(Law(
-        id="law-ban-x", civilization_id="c1", title="Sea ban",
-        raw_text="No fishing beyond the reef.",
-        canonical=CanonicalLaw(kind="ban"), complexity=1.0, tradition=0.1))
+        id="law-fest-x", civilization_id="c1", title="Harvest festival",
+        raw_text="Celebrate the harvest each autumn.",
+        canonical=CanonicalLaw(kind="festival"), complexity=1.0, tradition=0.1))
     chrono = WorldChronology("w1")
     engine = TurnEngine("w1", store, chrono, [civ])
 
@@ -351,3 +353,143 @@ def test_no_conflict_means_no_contradiction_penalty():
                                   scope_delta=len(rev.raw_text) / 500.0)
     assert rev.cost == pytest.approx(expected)
     assert snap.conflicts == []
+
+
+# ---------------------------------------------------------------------------
+# §16 — предпросмотр стоимости до подачи правки (POST /laws/{id}/cost_preview)
+# ---------------------------------------------------------------------------
+
+def test_cost_preview_matches_snapshot_price_exactly():
+    """The price shown before submission equals the price charged at cutoff."""
+    store, chrono, engine, civ, law = make_world()
+    body_text = "Exempt settlements below 200 souls."
+    preview = cost_of_law_change(
+        store.get_law("law-tax"), LawUserAction.AMEND_LAW, cfg=PricingConfig(),
+        scope_delta=len(body_text) / 500.0)
+    rev = store.record_revision(
+        "law-tax", "c1", LawUserAction.AMEND_LAW, body_text,
+        CanonicalLawChange(action=LawUserAction.AMEND_LAW,
+                           new_canonical=CanonicalLaw(kind="tax")),
+        now=DAY.replace(hour=7))
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+    report = engine.run_turn()
+    assert report.admin_costs["c1"] == pytest.approx(preview)
+
+
+def test_api_cost_preview_endpoint_no_time_of_day_dependency():
+    """REST preview returns identical numbers for identical edits described at
+    different wall-clock moments (the endpoint has no clock input at all)."""
+    from poem.api import WorldServer
+
+    srv = WorldServer("w1")
+    srv.add_civilization(Civilization(id="c1", name="Rivers", progress=0.25))
+    r = srv.handle("POST", "/api/v1/laws", {
+        "id": "law-x", "civilization_id": "c1", "title": "Tax",
+        "raw_text": "pay", "canonical": {"kind": "tax"}, "complexity": 1.5})
+    assert r["status"] == 200
+    body = {"action": "AmendLaw", "raw_text": "Exempt small ones.",
+            "new_canonical": {"kind": "tax"}}
+    p1 = srv.handle("POST", "/api/v1/laws/law-x/cost_preview", body)
+    p2 = srv.handle("POST", "/api/v1/laws/law-x/cost_preview", body)
+    assert p1["status"] == 200 and p2["status"] == 200
+    assert p1["estimated_cost"] == p2["estimated_cost"]
+    assert "времени" in p1["note"].lower()   # note: time of day never matters
+
+
+def test_api_cost_preview_counts_conflicts():
+    """Preview sees a contradicting active law and adds contradiction_penalty."""
+    from poem.api import WorldServer
+
+    srv = WorldServer("w1")
+    srv.add_civilization(Civilization(id="c1", name="Rivers", progress=0.25))
+    srv.handle("POST", "/api/v1/laws", {
+        "id": "law-a", "civilization_id": "c1", "title": "Head tax",
+        "raw_text": "pay", "canonical": {"kind": "tax"}})
+    srv.handle("POST", "/api/v1/laws", {
+        "id": "law-b", "civilization_id": "c1", "title": "Hearth tax",
+        "raw_text": "grain", "canonical": {"kind": "tax"}})
+    plain = srv.handle("POST", "/api/v1/laws/law-a/cost_preview",
+                       {"action": "ClarifyLaw", "raw_text": "x"})
+    # same edit but with an opposing canonical kind (tax -> ban): +1 conflict
+    opposed = srv.handle("POST", "/api/v1/laws/law-a/cost_preview",
+                         {"action": "AmendLaw", "raw_text": "x",
+                          "new_canonical": {"kind": "ban"}})
+    assert opposed["contradictions"] >= 1
+    assert opposed["estimated_cost"] > plain["estimated_cost"]
+
+
+# ---------------------------------------------------------------------------
+# §13 step 13 / §5.1 — конфликты РАЗНЫХ видов норм (tax vs ban и т.п.)
+# ---------------------------------------------------------------------------
+
+def test_kinds_conflict_matrix_is_symmetric():
+    from poem.core import kinds_conflict
+
+    assert kinds_conflict("tax", "ban") and kinds_conflict("ban", "tax")
+    assert kinds_conflict("corvee", "ban")
+    assert not kinds_conflict("tax", "corvee")
+    assert not kinds_conflict("festival", "ban")
+
+
+def test_amendment_introducing_contradicting_kind_pays_penalty():
+    """Changing a tax law into a ban while another ban is active => conflict
+    priced on the PROSPECTIVE canonical, not the old one (§5.1)."""
+    store = LawStore()
+    civ = Civilization(id="c1", name="Rivers", progress=0.25)
+    store.add_law(Law(id="law-a", civilization_id="c1", title="Roads",
+                      raw_text="build roads", canonical=CanonicalLaw(kind="tax")))
+    store.add_law(Law(id="law-b", civilization_id="c1", title="Timber ban",
+                      raw_text="no logging", canonical=CanonicalLaw(kind="ban")))
+    chrono = WorldChronology("w1")
+    engine = TurnEngine("w1", store, chrono, [civ])
+
+    rev = store.record_revision(
+        "law-a", "c1", LawUserAction.AMEND_LAW, "Turn road tax into logging ban.",
+        CanonicalLawChange(action=LawUserAction.AMEND_LAW,
+                           new_canonical=CanonicalLaw(kind="ban")),
+        now=DAY.replace(hour=10))
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+    snaps = engine.prepare_snapshot()
+    snap = next(s for s in snaps if s.civilization_id == "c1")
+    cfg = PricingConfig()
+    base = cost_of_law_change(store.get_law("law-a"), LawUserAction.AMEND_LAW,
+                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0)
+    # prospective kind "ban" conflicts with active law-b kind "ban" (same kind)
+    assert rev.cost == pytest.approx(base + cfg.contradiction_penalty)
+    assert any(c.law_a == "law-a" and c.law_b == "law-b" for c in snap.conflicts)
+
+
+# ---------------------------------------------------------------------------
+# §5.2 — срочность как игровой ресурс и переходный период в цене
+# ---------------------------------------------------------------------------
+
+def test_urgent_flag_adds_fixed_cost_not_clock_based():
+    """Urgency costs urgent_action_cost regardless of WHEN the edit was sent."""
+    law = Law(id="l", civilization_id="c", title="t", raw_text="",
+              canonical=None)
+    cfg = PricingConfig()
+    calm = cost_of_law_change(law, LawUserAction.AMEND_LAW, cfg=cfg)
+    fast = cost_of_law_change(law, LawUserAction.AMEND_LAW, cfg=cfg, urgent=True)
+    assert fast - calm == cfg.urgent_action_cost
+
+
+def test_transition_years_increase_price_and_are_charged():
+    """A 10-year transitional period adds transition_cost_per_year*10 (§5.2),
+    both in snapshot pricing and in the charged admin budget."""
+    store, chrono, engine, civ, law = make_world()
+    civ.annual_production_rate = 100.0
+    rev = store.record_revision(
+        "law-tax", "c1", LawUserAction.AMEND_LAW, "Gradual tax reform.",
+        CanonicalLawChange(action=LawUserAction.AMEND_LAW,
+                           new_canonical=CanonicalLaw(kind="tax"),
+                           transition=SimDuration(years=10.0)),
+        now=DAY.replace(hour=12))
+    cfg = PricingConfig()
+    # Base price computed BEFORE the turn: identical inputs, no transition.
+    base = cost_of_law_change(store.get_law("law-tax"), LawUserAction.AMEND_LAW,
+                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0,
+                              transition_years=0.0)
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+    report = engine.run_turn()
+    assert rev.cost == pytest.approx(base + 10.0 * cfg.transition_cost_per_year)
+    assert report.admin_costs["c1"] == pytest.approx(rev.cost)

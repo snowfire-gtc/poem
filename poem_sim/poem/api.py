@@ -25,6 +25,7 @@ from .core import (
     TimedEffectKind,
 )
 from .laws import LawStore
+from .pricing import cost_of_law_change
 from .turn import ACCEPTED_NOTICE, DEFERRED_NOTICE, TurnEngine
 
 
@@ -124,6 +125,7 @@ class WorldServer:
                     if body.get("canonical_change", {}).get("new_canonical") else None
                 ),
                 suspend_years=body.get("canonical_change", {}).get("suspend_years"),
+                urgent=bool(body.get("canonical_change", {}).get("urgent", False)),
                 transition=(
                     SimDuration(**body["canonical_change"]["transition"])
                     if body.get("canonical_change", {}).get("transition") else None
@@ -187,6 +189,61 @@ class WorldServer:
             "cutoff": cutoff.isoformat() if cutoff else None,
             "note": "Время подачи правки не влияет на эффективность (TASK-060).",
         }
+
+    # ================= cost preview (§16: "показывать стоимость") ==========
+
+    def preview_cost(self, path: str, body: dict) -> dict:
+        """Estimate the §5.1 price of a *not yet submitted* edit.
+
+        Uses exactly the same inputs as snapshot pricing (law state, action
+        weight, scope volume, prospective canonical conflicts, transition,
+        urgency), so the number shown to the player before submission is the
+        number charged at the cutoff — no drift, and no wall-clock term ever
+        (§20.5).
+        """
+        law_id = _path_id(path, "laws")
+        law = self.store.get_law(law_id)
+        action = LawUserAction(body["action"])
+        new_canonical = None
+        if body.get("new_canonical") is not None:
+            new_canonical = CanonicalLaw(**body["new_canonical"])
+        transition_years = float(body.get("transition_years", 0.0))
+        urgent = bool(body.get("urgent", False))
+        scope_delta = len(body.get("raw_text", "")) / 500.0
+
+        contradictions = self._count_preview_conflicts(
+            law, new_canonical or law.canonical)
+        cost = cost_of_law_change(
+            law, action, cfg=self.engine.pricing_cfg,
+            scope_delta=scope_delta,
+            contradictions=contradictions,
+            transition_years=transition_years,
+            urgent=urgent,
+        )
+        return {
+            "estimated_cost": cost,
+            "contradictions": contradictions,
+            "breakdown_available": True,
+            "note": "Стоимость не зависит от времени подачи правки.",
+
+        }
+
+    def _count_preview_conflicts(self, law, canon) -> int:
+        """Conflict count against the current active set (no turn running)."""
+        from .core import kinds_conflict
+
+        if canon is None:
+            return 0
+        count = 0
+        for other in self.store.laws_of(law.civilization_id):
+            if other.id == law.id or other.canonical is None:
+                continue
+            if other.status.value not in ("active", "in_transition"):
+                continue
+            if other.canonical.kind == canon.kind or \
+                    kinds_conflict(canon.kind, other.canonical.kind):
+                count += 1
+        return count
 
     # ================= chronology (§15.4) ===================================
 
@@ -294,7 +351,8 @@ def _normalize_path(path: str) -> str:
 
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
-                 "turns", "api", "v1", "submit", "cancel", "treaties", "civilizations"}
+                 "turns", "api", "v1", "submit", "cancel", "treaties",
+                 "civilizations", "cost_preview"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -360,6 +418,7 @@ _ROUTE_TABLE = [
     ("GET", r"^/api/v1/laws/drafts/\{id\}$", WorldServer.get_drafts),
     ("DELETE", r"^/api/v1/laws/drafts/\{id\}$", WorldServer.delete_draft),
     ("POST", r"^/api/v1/laws/\{id\}/revisions$", WorldServer.create_revision),
+    ("POST", r"^/api/v1/laws/\{id\}/cost_preview$", WorldServer.preview_cost),
     ("GET", r"^/api/v1/laws/\{id\}/revisions$", WorldServer.get_revisions),
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/submit$", WorldServer.submit_revision),
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/cancel$", WorldServer.cancel_revision),
