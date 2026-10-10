@@ -17,6 +17,7 @@ from .core import (  # noqa: F401
     DraftStatus,
     Era,
     EraSource,
+    FolkloreItem,
     GameSpeed,
     Law,
     LawConflict,
@@ -49,7 +50,7 @@ from .api import WorldServer  # noqa: F401
 
 __all__ = [
     "CanonicalLaw", "CanonicalLawChange", "CustomaryLaw", "DraftStatus", "Era",
-    "EraSource", "GameSpeed", "Law", "LawConflict", "LawDraft", "LawRevision",
+    "EraSource", "FolkloreItem", "GameSpeed", "Law", "LawConflict", "LawDraft", "LawRevision",
     "LawRevisionStatus", "LawStatus", "LawUserAction", "SeasonId", "SimDuration",
     "TimedEffect", "TimedEffectKind", "Treaty", "Turn", "TurnLawSnapshot",
     "TurnStatus", "Civilization", "TurnIntervalRule", "WorldChronology",

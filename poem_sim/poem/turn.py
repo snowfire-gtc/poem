@@ -24,6 +24,8 @@ from .chronology import (
     WorldChronology,
     advance_chronology,
     calculate_turn_span,
+    folklore_mutation_gain,
+    folklore_spread_gain,
     population_growth_this_turn,
     production_this_turn,
     research_progress_this_turn,
@@ -32,6 +34,7 @@ from .chronology import (
 from .core import (
     CustomaryLaw,
     Era,
+    FolkloreItem,
     Law,
     LawRevision,
     LawRevisionStatus,
@@ -79,6 +82,7 @@ class TurnReport:
     superseded_revisions: list[str] = field(default_factory=list)
     expired_effects: list[str] = field(default_factory=list)
     economy: dict[str, dict[str, float]] = field(default_factory=dict)
+    folklore: dict[str, dict[str, float]] = field(default_factory=dict)
     notices: list[str] = field(default_factory=list)
 
 
@@ -100,6 +104,8 @@ class TurnEngine:
         self.civilizations = {c.id: c for c in civilizations}
         self.pricing_cfg = pricing_cfg or PricingConfig()
         self.timed_effects: list[TimedEffect] = timed_effects or []
+        # Folklore corpus (§11.5): spread/mutation scale with GAME time only.
+        self.folklore: list[FolkloreItem] = []
         self.turns: list[Turn] = []
         self.current_turn: Turn | None = None
         # ids of timed effects that existed before the current turn started
@@ -295,6 +301,37 @@ class TurnEngine:
                 survivors.append(eff)
         self.timed_effects = survivors
 
+        # Step 14 (§11.5): update folklore — spread & mutation scale with the
+        # turn's GAME-time span, never with real-world time of day (§20.4).
+        # Laws repealed in this very turn also leave customary remnants that
+        # feed their topic's mutation (conflict with living memory of the law).
+        remnant_topics = {
+            r.id for snap in self._snapshot_list for r in snap.customary_remnants
+        }
+        for rev_id in applied:
+            rev = self.store.get_revision(rev_id)
+            if rev.action == LawUserAction.REPEAL_LAW:
+                remnant_topics.add(rev.law_id)
+        folklore: dict[str, dict[str, float]] = {}
+        for item in self.folklore:
+            if item.topic in remnant_topics and item.conflict_factor <= 0.0:
+                item.conflict_factor = 0.5  # repealed law lingers in folk memory
+            s_gain = folklore_spread_gain(0.01, span, item.oral_strength)
+            m_gain = folklore_mutation_gain(
+                0.005, span, item.oral_strength, item.distance_factor,
+                # 0 conflict => neutral multiplier 1.0; any tension amplifies
+                # mutation (§11.5 conflict_factor).
+                1.0 + item.conflict_factor,
+            )
+            item.spread += s_gain
+            item.mutation += m_gain
+            folklore[item.id] = {
+                "spread": item.spread,
+                "mutation": item.mutation,
+                "spread_gain": s_gain,
+                "mutation_gain": m_gain,
+            }
+
         # Mark included revisions as Applied.
         for rev_id in applied:
             self.store.mark_applied(rev_id)
@@ -339,6 +376,7 @@ class TurnEngine:
             superseded_revisions=list(self._superseded_list),
             expired_effects=expired,
             economy=economy,
+            folklore=folklore,
             notices=notices,
         )
 

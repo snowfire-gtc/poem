@@ -197,6 +197,25 @@ class CustomaryLaw:
 
 
 @dataclass
+class FolkloreItem:
+    """A folk narrative/belief tied to a civilization (§11.5).
+
+    Spread and mutation are driven by ANNUAL rates scaled by the turn's
+    game-time span — never by real-world time of day (§20.4).
+    """
+
+    id: str
+    civilization_id: CivilizationId
+    title: str
+    topic: str = ""                 # e.g. law id or theme it references
+    spread: float = 0.1             # how widely known (0..1+)
+    mutation: float = 0.0           # accumulated drift from the origin (0..1+)
+    oral_strength: float = 1.0      # carrier strength (bards, markets, roads)
+    distance_factor: float = 1.0    # isolation slows convergence, speeds drift
+    conflict_factor: float = 0.0    # tension with active laws boosts mutation
+
+
+@dataclass
 class LawConflict:
     law_a: LawId
     law_b: LawId | None = None      # None => conflict with folklore/custom

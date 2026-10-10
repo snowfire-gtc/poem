@@ -70,3 +70,17 @@ CREATE TABLE IF NOT EXISTS turns (
     era_before TEXT NOT NULL,
     era_after TEXT NOT NULL
 );
+
+-- Folklore corpus (§11.5): spread & mutation scale with GAME time only.
+CREATE TABLE IF NOT EXISTS folklore_items (
+    id UUID PRIMARY KEY,
+    world_id UUID NOT NULL,
+    civilization_id UUID NOT NULL,
+    title TEXT NOT NULL,
+    topic TEXT NOT NULL DEFAULT '',
+    spread DOUBLE PRECISION NOT NULL DEFAULT 0.1,
+    mutation DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    oral_strength DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    distance_factor DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    conflict_factor DOUBLE PRECISION NOT NULL DEFAULT 0.0
+);

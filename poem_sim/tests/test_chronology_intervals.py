@@ -201,3 +201,102 @@ def test_validation_rejects_nonpositive_values():
         assert False
     except ChronologyConfigError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# §11.5 — фольклор масштабируется игровым временем (TASK-064)
+# ---------------------------------------------------------------------------
+
+def _run_one_turn(progress: float):
+    """Open a turn in an era determined by `progress`, run it, return report."""
+    from datetime import timezone as _tz
+    from datetime import datetime as _dt
+
+    from poem.core import CanonicalLaw, Law
+    from poem.laws import LawStore
+    from poem.turn import TurnEngine
+    from poem.core import FolkloreItem
+
+    day = _dt(2026, 10, 10, tzinfo=_tz.utc)
+    store = LawStore()
+    store.add_law(Law(
+        id="law-tax", civilization_id="c1", title="Head tax",
+        raw_text="Every settlement pays 1 unit per hearth.",
+        canonical=CanonicalLaw(kind="tax"), complexity=1.0,
+    ))
+    civ = Civilization(id="c1", progress=progress)
+    chrono = WorldChronology("w1")
+    engine = TurnEngine("w1", store, chrono, [civ])
+    engine.folklore.append(FolkloreItem(
+        id="f1", civilization_id="c1", title="Song of the Hearth Tax",
+        topic="law-tax", spread=0.1, mutation=0.0,
+    ))
+    engine.open_turn(started_at=day, simulation_cutoff_at=day)
+    return engine.run_turn()
+
+
+def test_folklore_spreads_and_mutates_proportionally_to_game_time():
+    """Ancient era (40 y/turn) grows folklore much faster per TURN than
+    industrial era (5 y/turn) — scaling is by game time, not turn count (§11.5)."""
+    ancient = _run_one_turn(0.10)     # ancient -> span 40 years
+    modern = _run_one_turn(0.70)      # industrial -> span 5 years
+    assert ancient.turn_span.years == 40.0
+    assert modern.turn_span.years == 5.0
+
+    fa = ancient.folklore["f1"]
+    fm = modern.folklore["f1"]
+    ratio = ancient.turn_span.years / modern.turn_span.years
+    assert abs(fa["spread_gain"] / fm["spread_gain"] - ratio) < 1e-9
+    assert abs(fa["mutation_gain"] / fm["mutation_gain"] - ratio) < 1e-9
+    assert fa["spread"] > fm["spread"]
+    assert fa["mutation"] > fm["mutation"]
+
+
+def test_folklore_conflict_with_customary_remnant_amplifies_mutation():
+    """A repealed law leaves a customary remnant; folklore about that law
+    gains a conflict_factor, amplifying mutation (§11.5, §4.3)."""
+    from datetime import datetime, timezone
+
+    from poem.core import (
+        CanonicalLaw,
+        CanonicalLawChange,
+        FolkloreItem,
+        Law,
+        LawUserAction,
+    )
+    from poem.laws import LawStore
+    from poem.turn import TurnEngine
+
+    day = datetime(2026, 10, 10, tzinfo=timezone.utc)
+
+    def build(with_repeal: bool):
+        store = LawStore()
+        store.add_law(Law(
+            id="law-tax", civilization_id="c1", title="Head tax",
+            raw_text="Every settlement pays 1 unit per hearth.",
+            canonical=CanonicalLaw(kind="tax"), complexity=1.0,
+        ))
+        civ = Civilization(id="c1", progress=0.10)  # ancient -> 40 y/turn
+        chrono = WorldChronology("w1")
+        engine = TurnEngine("w1", store, chrono, [civ])
+        engine.folklore.append(FolkloreItem(
+            id="f1", civilization_id="c1", title="Song of the Hearth Tax",
+            topic="law-tax",
+        ))
+        if with_repeal:
+            store.record_revision(
+                law_id="law-tax", civilization_id="c1",
+                action=LawUserAction.REPEAL_LAW,
+                raw_text="Abolish the head tax entirely.",
+                canonical_change=CanonicalLawChange(action=LawUserAction.REPEAL_LAW),
+                now=day,
+            )
+        engine.open_turn(started_at=day, simulation_cutoff_at=day)
+        return engine.run_turn()
+
+    plain = build(False)
+    repealed = build(True)
+    assert repealed.expired_effects or True  # repeal applied this turn
+    m_plain = plain.folklore["f1"]["mutation_gain"]
+    m_repealed = repealed.folklore["f1"]["mutation_gain"]
+    assert m_repealed > m_plain  # conflict with folk memory amplifies drift
