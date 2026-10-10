@@ -313,7 +313,8 @@ def test_norm_conflict_raises_revision_cost_and_is_recorded_in_snapshot():
     cfg = PricingConfig()
     base = cost_of_law_change(store.get_law("law-tax-a"),
                               LawUserAction.AMEND_LAW, cfg=cfg,
-                              scope_delta=len(rev.raw_text) / 500.0)
+                              scope_delta=len(rev.raw_text) / 500.0,
+                              active_laws=snap.active_laws)
     with_conflict = base + cfg.contradiction_penalty * 1
     assert rev.cost == pytest.approx(with_conflict)
     assert any(c.law_a == "law-tax-a" and c.law_b == "law-tax-b"
@@ -350,7 +351,8 @@ def test_no_conflict_means_no_contradiction_penalty():
 
     expected = cost_of_law_change(store.get_law("law-tax-a"),
                                   LawUserAction.CLARIFY_LAW, cfg=PricingConfig(),
-                                  scope_delta=len(rev.raw_text) / 500.0)
+                                  scope_delta=len(rev.raw_text) / 500.0,
+                                  active_laws=snap.active_laws)
     assert rev.cost == pytest.approx(expected)
     assert snap.conflicts == []
 
@@ -453,7 +455,8 @@ def test_amendment_introducing_contradicting_kind_pays_penalty():
     snap = next(s for s in snaps if s.civilization_id == "c1")
     cfg = PricingConfig()
     base = cost_of_law_change(store.get_law("law-a"), LawUserAction.AMEND_LAW,
-                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0)
+                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0,
+                              active_laws=snap.active_laws)
     # prospective kind "ban" conflicts with active law-b kind "ban" (same kind)
     assert rev.cost == pytest.approx(base + cfg.contradiction_penalty)
     assert any(c.law_a == "law-a" and c.law_b == "law-b" for c in snap.conflicts)
@@ -486,10 +489,12 @@ def test_transition_years_increase_price_and_are_charged():
         now=DAY.replace(hour=12))
     cfg = PricingConfig()
     # Base price computed BEFORE the turn: identical inputs, no transition.
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+    snaps = engine.prepare_snapshot()
+    _snap = next(s for s in snaps if s.civilization_id == "c1")
     base = cost_of_law_change(store.get_law("law-tax"), LawUserAction.AMEND_LAW,
                               cfg=cfg, scope_delta=len(rev.raw_text) / 500.0,
-                              transition_years=0.0)
-    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
-    report = engine.run_turn()
+                              transition_years=0.0, active_laws=_snap.active_laws)
     assert rev.cost == pytest.approx(base + 10.0 * cfg.transition_cost_per_year)
+    report = engine.run_turn()
     assert report.admin_costs["c1"] == pytest.approx(rev.cost)

@@ -298,6 +298,9 @@ class TurnEngine:
                         winner.canonical_change.transition.years
                         if winner.canonical_change.transition else 0.0),
                     urgent=winner.canonical_change.urgent,
+                    # §5 «уровень бюрократии»: the civ's own active norm set
+                    # (final config of this snapshot) strains administration.
+                    active_laws=snap.active_laws,
                 )
             snapshots.append(snap)
 

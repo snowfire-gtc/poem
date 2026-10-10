@@ -296,12 +296,24 @@ class WorldServer:
 
         contradictions = self._count_preview_conflicts(
             law, new_canonical or law.canonical, action=action)
+        # §5 «уровень бюрократии»: same input as snapshot pricing — the civ's
+        # FINAL active norm set. The engine prices amendments against the
+        # post-repeal configuration (§13 step 13), so a prospective REPEAL
+        # removes its own law from the bureaucratic load already at preview
+        # time: after repeal the law is no longer administered. Without this
+        # exclusion preview and charge drift by one bureaucracy step.
+        active_laws = [
+            l for l in self.store.laws_of(law.civilization_id)
+            if l.status.value in ("active", "in_transition")
+            and not (action == LawUserAction.REPEAL_LAW and l.id == law.id)
+        ]
         cost = cost_of_law_change(
             law, action, cfg=self.engine.pricing_cfg,
             scope_delta=scope_delta,
             contradictions=contradictions,
             transition_years=transition_years,
             urgent=urgent,
+            active_laws=active_laws,
         )
         return {
             "estimated_cost": cost,
