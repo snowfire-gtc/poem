@@ -172,32 +172,72 @@ class WorldServer:
     # ================= pending (§15.3) =====================================
 
     def get_pending(self, path: str, body: dict) -> dict:
-        """Shows which edits join which slice, superseded/rejected/deferred lists."""
+        """§15.3 — five buckets required by the design doc:
+
+         * what will be counted in the NEXT slice (pending, before cutoff);
+         * what has ALREADY joined the current snapshot (IncludedInSimulation);
+         * what was SUPERSEDED by a later confirmed version;
+         * what was REJECTED;
+         * what AWAITS the next turn (received after the cutoff — preserved,
+           never discarded, no time-of-day penalty, §4.4).
+        """
         from .core import LawRevisionStatus as LRS
 
         turn = self.engine.current_turn
         cutoff = turn.simulation_cutoff_at if turn else None
-        included, deferred, superseded, rejected = [], [], [], []
+        will_apply, in_snapshot, deferred, superseded, rejected = [], [], [], [], []
         for rev in self.store._revisions.values():
             payload = _revision_json(rev)
             if rev.status == LRS.PENDING:
                 if cutoff is not None and rev.received_at > cutoff:
                     deferred.append(payload)      # будет учтена в следующем ходу
                 else:
-                    included.append(payload)      # войдёт в текущий снимок
+                    will_apply.append(payload)    # войдёт в текущий снимок
+            elif rev.status == LRS.INCLUDED_IN_SIMULATION:
+                in_snapshot.append(payload)       # уже вошла в снимок этого хода
             elif rev.status == LRS.SUPERSEDED:
                 superseded.append(payload)        # перезаписана более поздней
             elif rev.status == LRS.REJECTED:
                 rejected.append(payload)
-            else:
-                included.append(payload)          # IncludedInSimulation / Applied
+            # APPLIED revisions are already part of the law's official
+            # version history (GET /api/v1/laws/{id}); they are neither
+            # pending nor "in this turn's snapshot" anymore (§3.4 statuses).
         return {
-            "will_apply_this_slice": included,
+            "will_apply_this_slice": will_apply,
+            "included_in_current_snapshot": in_snapshot,
             "awaiting_next_turn": deferred,
             "superseded": superseded,
             "rejected": rejected,
             "cutoff": cutoff.isoformat() if cutoff else None,
             "note": "Время подачи правки не влияет на эффективность (TASK-060).",
+        }
+
+    def get_snapshot(self, path: str, body: dict) -> dict:
+        """§4.3 / §15.3 — the exact TurnLawSnapshot the simulation reads.
+
+        Readable at any time; reflects the last prepared snapshot (statuses
+        IncludedInSimulation correspond to what has already joined it)."""
+        snaps = self.engine.last_snapshots
+        return {
+            "turn_id": snaps[0].turn_id if snaps else None,
+            "civilizations": [
+                {
+                    "civilization_id": s.civilization_id,
+                    "active_laws": [l.id for l in s.active_laws],
+                    "pending_amendments": [r.id for r in s.pending_amendments],
+                    "pending_repeals": [r.id for r in s.pending_repeals],
+                    "suspended_laws": list(s.suspended_laws),
+                    "customary_remnants": [c.id for c in s.customary_remnants],
+                    "conflicts": [
+                        {"law_a": c.law_a, "law_b": c.law_b,
+                         "folklore_ref": c.folklore_ref,
+                         "description": c.description}
+                        for c in s.conflicts
+                    ],
+                }
+                for s in snaps
+            ],
+            "note": "Симуляция читает именно этот снимок (§4.3).",
         }
 
     # ================= cost preview (§16: "показывать стоимость") ==========
@@ -465,7 +505,7 @@ def _normalize_path(path: str) -> str:
 
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
-                 "turns", "report", "api", "v1", "submit", "cancel", "treaties",
+                 "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "wars",
                  "civilizations", "cost_preview"}
     if token in known_ids:
@@ -538,6 +578,9 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/submit$", WorldServer.submit_revision),
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/cancel$", WorldServer.cancel_revision),
     ("GET", r"^/api/v1/laws/pending$", WorldServer.get_pending),
+    # §4.3: снимок активных законов, который читает симуляция (инспектируется
+    # клиентом; правки со статусом IncludedInSimulation уже вошли в него).
+    ("GET", r"^/api/v1/laws/snapshot$", WorldServer.get_snapshot),
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),

@@ -179,3 +179,57 @@ def test_api_treaty_stored_in_game_time():
 def test_api_unknown_route_404():
     srv = server_with_law()
     assert srv.handle("GET", "/api/v1/nope")["status"] == 404
+
+
+def test_pending_buckets_match_section_15_3():
+    """§15.3: response must distinguish 'joined the current snapshot' from
+    'will be counted in the next slice' and 'awaiting next turn'."""
+    srv = server_with_law()
+    cutoff = DAY.replace(hour=20)
+    srv.handle("POST", "/api/v1/worlds/w1/turns/open",
+               {"started_at": DAY.isoformat(), "simulation_cutoff_at": cutoff.isoformat()})
+    early = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+        "civilization_id": "c1", "action": "AmendLaw", "raw_text": "before cutoff",
+        "now": DAY.replace(hour=9).isoformat()})["revision"]
+    late = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+        "civilization_id": "c1", "action": "ClarifyLaw", "raw_text": "after cutoff",
+        "now": DAY.replace(hour=21).isoformat()})["revision"]
+
+    # before prepare_snapshot: nothing has joined a snapshot yet
+    p0 = srv.handle("GET", "/api/v1/laws/pending")
+    assert p0["included_in_current_snapshot"] == []
+    assert [r["id"] for r in p0["will_apply_this_slice"]] == [early["id"]]
+    assert [r["id"] for r in p0["awaiting_next_turn"]] == [late["id"]]
+
+    engine = srv.engine
+    engine.prepare_snapshot(now=cutoff)
+    p1 = srv.handle("GET", "/api/v1/laws/pending")
+    ids_in_snap = [r["id"] for r in p1["included_in_current_snapshot"]]
+    assert early["id"] in ids_in_snap          # уже вошла в текущий снимок
+    assert late["id"] not in ids_in_snap       # ожидает следующего хода
+
+
+def test_snapshot_endpoint_exposes_turn_law_snapshot():
+    """§4.3: GET /api/v1/laws/snapshot returns exactly what the simulation reads."""
+    srv = server_with_law()
+    cutoff = DAY.replace(hour=20)
+    srv.handle("POST", "/api/v1/worlds/w1/turns/open",
+               {"started_at": DAY.isoformat(), "simulation_cutoff_at": cutoff.isoformat()})
+    rev = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+        "civilization_id": "c1", "action": "SuspendLaw",
+        "raw_text": "suspend it", "suspend_years": 1.0,
+        "now": DAY.replace(hour=10).isoformat()})["revision"]
+
+    srv.engine.prepare_snapshot(now=cutoff)
+    snap = srv.handle("GET", "/api/v1/laws/snapshot")
+    assert snap["status"] == 200
+    civ = snap["civilizations"][0]
+    assert civ["civilization_id"] == "c1"
+    assert "law-tax" in civ["suspended_laws"]           # suspension recorded (§4.2)
+    assert rev["id"] in civ["pending_amendments"]
+    assert "law-tax" not in civ["active_laws"]          # not active this turn
+    # after the turn finalizes, the snapshot remains inspectable (§15.3)
+    run = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {})
+    assert run["status"] == 200
+    snap2 = srv.handle("GET", "/api/v1/laws/snapshot")
+    assert rev["id"] in snap2["civilizations"][0]["pending_amendments"]

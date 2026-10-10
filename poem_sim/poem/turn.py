@@ -135,6 +135,9 @@ class TurnEngine:
         self._snapshot_list: list[TurnLawSnapshot] = []
         self._deferred_list: list[str] = []
         self._superseded_list: list[str] = []
+        # §15.3: last prepared snapshot, readable by the API even after the
+        # turn has been finalized (until the next prepare_snapshot overwrites).
+        self.last_snapshots: list[TurnLawSnapshot] = []
 
     # ------------------------------------------------------------------ turns
 
@@ -233,6 +236,11 @@ class TurnEngine:
                 winner_action = winner.action if winner is not None else None
                 if winner_action == LawUserAction.REPEAL_LAW:
                     pass  # recorded in snap.pending_repeals; not active anymore
+                elif winner_action == LawUserAction.SUSPEND_LAW:
+                    # §4.2/§4.3: the winning suspension means the law is NOT
+                    # part of this turn's active set (it joins suspended_laws
+                    # in pass 2, together with its priced revision).
+                    pass
                 elif law.status == LawStatus.ACTIVE:
                     snap.active_laws.append(law)
                 elif law.status == LawStatus.SUSPENDED:
@@ -283,6 +291,9 @@ class TurnEngine:
 
         turn.status = TurnStatus.SNAPSHOT_PREPARED
         self._snapshot_list = snapshots
+        # §15.3: the snapshot itself is a server-side artefact players can
+        # inspect (active set, pending edits, suspensions, conflicts).
+        self.last_snapshots = snapshots
         return snapshots
 
     # ------------------------------------------------------------ simulation
