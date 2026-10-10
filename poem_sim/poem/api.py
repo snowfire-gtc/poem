@@ -23,6 +23,7 @@ from .core import (
     LawStatus,
     LawUserAction,
     SimDuration,
+    SeasonId,
     TimedEffect,
     TimedEffectKind,
     War,
@@ -46,9 +47,14 @@ class WorldServer:
         world_id: str,
         game_speed: GameSpeed = GameSpeed.STANDARD,
         era_source: EraSource = EraSource.MEDIAN_ACTIVE_CIVILIZATIONS,
+        season: SeasonId | None = None,
     ) -> None:
         self.store = LawStore()
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
+        if season is not None:
+            # Setting-specific calendar (alien planet, §7.2): e.g. a world
+            # whose year begins with LONG_NIGHT (§15.4 sample response).
+            self.chronology.current_season = season
         self.civilizations: dict[str, Civilization] = {}
         self.timed_effects: list[TimedEffect] = []
         # Published turn reports (§13 step 22); the client fetches the last one.

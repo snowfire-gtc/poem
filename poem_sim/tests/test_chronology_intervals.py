@@ -336,3 +336,56 @@ def test_envoy_travel_expires_by_game_time_not_turn_count():
             break
     assert arrivals == 3                    # 2+2+2 >= 5 — same game time (5 лет)
     assert t_modern.remaining.years <= 0
+
+
+# ---------------------------------------------------------------------------
+# §7.2 / §15.4 — setting-specific calendar (alien planet seasons)
+# ---------------------------------------------------------------------------
+
+def test_long_night_season_survives_turn_ticks():
+    """A world configured with the LONG_NIGHT season (§15.4 sample) must keep
+    its own cycle when chronology advances, instead of collapsing to spring."""
+    from poem.chronology import advance_chronology, season_cycle_for
+    from poem.core import SeasonId, SimDuration
+
+    ch = WorldChronology("w1")
+    ch.current_season = SeasonId.LONG_NIGHT
+    civs = [Civilization(id="c1", name="Rivers", progress=0.25)]  # classical, 25 y/turn
+
+    seen = []
+    for _ in range(8):
+        span = calculate_turn_span(ch, civs)
+        advance_chronology(ch, span, civs)
+        seen.append(ch.current_season)
+
+    # The cycle is exactly the world's own ordered table rotated by whole
+    # years (25 y * 4 seasons = 100 seasons ≡ 0 mod 4 → stays on LONG_NIGHT).
+    assert set(seen) == {SeasonId.LONG_NIGHT}
+    # ...and a fractional tick moves within the SETTING cycle, not earth names
+    from poem.chronology import advance_season
+    table = season_cycle_for(ch)
+    nxt = advance_season(SeasonId.LONG_NIGHT, 1, cycle=table)
+    assert nxt == table[1]  # thaw/spring slot inside the long-night calendar
+
+
+def test_api_chronology_reports_configured_season():
+    """GET /chronology (§15.4) echoes the world's actual season value."""
+    from datetime import datetime, timezone
+
+    from poem.api import WorldServer
+    from poem.core import SeasonId
+
+    server = WorldServer("w-season", season=SeasonId.LONG_NIGHT)
+    resp = server.handle("GET", "/api/v1/worlds/w-season/chronology")
+    assert resp["status"] == 200
+    assert resp["current_season"] == "long_night"
+
+    # after running one turn the season remains in the setting cycle (§7.2)
+    now = datetime(2026, 10, 11, tzinfo=timezone.utc)
+    resp = server.handle(
+        "POST", "/api/v1/worlds/w-season/turns/run",
+        {"started_at": now.isoformat(), "simulation_cutoff_at": now.isoformat()},
+    )
+    assert resp["status"] == 200
+    resp = server.handle("GET", "/api/v1/worlds/w-season/chronology")
+    assert resp["current_season"] == "long_night"
