@@ -141,6 +141,7 @@ class CanonicalLaw:
     kind: str                      # e.g. "tax", "corvee", "ban"
     scope: dict = field(default_factory=dict)   # {"population_below": 200} etc.
     effect: dict = field(default_factory=dict)  # parameterised effects
+    refs: tuple = ()               # ids of other laws this norm depends on
     text_summary: str = ""
 
 
@@ -237,6 +238,7 @@ class LawConflict:
     law_a: LawId
     law_b: LawId | None = None      # None => conflict with folklore/custom
     folklore_ref: str | None = None
+    revision_id: str | None = None  # the pending edit that creates this clash
     severity: float = 0.5
     description: str = ""
 

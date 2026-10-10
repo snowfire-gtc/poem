@@ -123,13 +123,14 @@ class WorldServer:
 
     def create_revision(self, path: str, body: dict) -> dict:
         law_id = _path_id(path, "laws")
+        action = _parse_action(body["action"])
         rev = self.store.record_revision(
             law_id=law_id,
             civilization_id=body["civilization_id"],
-            action=LawUserAction(body["action"]),
+            action=action,
             raw_text=body["raw_text"],
             canonical_change=CanonicalLawChange(
-                action=LawUserAction(body["action"]),
+                action=action,
                 new_canonical=(
                     CanonicalLaw(**body["canonical_change"]["new_canonical"])
                     if body.get("canonical_change", {}).get("new_canonical") else None
@@ -231,6 +232,8 @@ class WorldServer:
                     "conflicts": [
                         {"law_a": c.law_a, "law_b": c.law_b,
                          "folklore_ref": c.folklore_ref,
+                         "revision_id": c.revision_id,
+                         "severity": c.severity,
                          "description": c.description}
                         for c in s.conflicts
                     ],
@@ -253,7 +256,7 @@ class WorldServer:
         """
         law_id = _path_id(path, "laws")
         law = self.store.get_law(law_id)
-        action = LawUserAction(body["action"])
+        action = _parse_action(body["action"])
         new_canonical = None
         if body.get("new_canonical") is not None:
             new_canonical = CanonicalLaw(**body["new_canonical"])
@@ -262,7 +265,7 @@ class WorldServer:
         scope_delta = len(body.get("raw_text", "")) / 500.0
 
         contradictions = self._count_preview_conflicts(
-            law, new_canonical or law.canonical)
+            law, new_canonical or law.canonical, action=action)
         cost = cost_of_law_change(
             law, action, cfg=self.engine.pricing_cfg,
             scope_delta=scope_delta,
@@ -278,21 +281,36 @@ class WorldServer:
 
         }
 
-    def _count_preview_conflicts(self, law, canon) -> int:
-        """Conflict count against the current active set (no turn running)."""
-        from .core import kinds_conflict
+    def _count_preview_conflicts(self, law, canon, action=None) -> int:
+        """Conflict count against the current active set (no turn running).
 
-        if canon is None:
-            return 0
+        Mirrors the engine's step-13 rules (§5.1 «конфликт с другими
+        законами»): same-kind overlap, contradictory kind pairs, and — for a
+        prospective REPEAL — dependency references from surviving laws.
+        """
+        from .core import LawUserAction as _A, kinds_conflict
+
         count = 0
         for other in self.store.laws_of(law.civilization_id):
             if other.id == law.id or other.canonical is None:
                 continue
             if other.status.value not in ("active", "in_transition"):
                 continue
-            if other.canonical.kind == canon.kind or \
-                    kinds_conflict(canon.kind, other.canonical.kind):
+            if canon is not None and (
+                    other.canonical.kind == canon.kind
+                    or kinds_conflict(canon.kind, other.canonical.kind)):
                 count += 1
+        if action == _A.REPEAL_LAW:
+            for other in self.store.laws_of(law.civilization_id):
+                if other.id == law.id or other.status.value not in (
+                        "active", "in_transition"):
+                    continue
+                depends = (
+                    law.id in getattr(other.canonical, "refs", ())
+                    if other.canonical is not None else False
+                ) or (bool(law.title) and law.title in other.raw_text)
+                if depends:
+                    count += 1
         return count
 
     # ================= chronology (§15.4) ===================================
@@ -325,6 +343,11 @@ class WorldServer:
         return {"turn_id": turn.id, "turn_span_years": turn.turn_span.years}
 
     def run_turn(self, path: str, body: dict) -> dict:
+        # Convenience: if no turn is open and the request supplies the
+        # schedule, open it first — one-call turn execution for clients.
+        if self.engine.current_turn is None and "started_at" in body \
+                and "simulation_cutoff_at" in body:
+            self.open_turn(path, body)
         report = self.engine.run_turn()
         # Publish the turn report (§13 step 22): raw numbers plus the
         # generated client view and queued illustration tasks.
@@ -512,6 +535,26 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
         return False
     prev = parts[index - 1] if index else ""
     return prev in {"laws", "drafts", "revisions", "worlds", "treaties"}
+
+
+def _parse_action(value: str) -> LawUserAction:
+    """Accept both canonical enum names (§3.2 ``RepealLaw``) and snake_case
+    aliases (``repeal_law``) so clients never trip over casing."""
+    text = str(value)
+    try:
+        return LawUserAction(text)
+    except ValueError:
+        pass
+    try:
+        return LawUserAction[text.upper()]          # REPEAL_LAW form
+    except ValueError:
+        pass
+    # snake/kebab-case -> CamelCase member name ("repeal_law" -> "RepealLaw")
+    pascal = "".join(w.capitalize() for w in text.replace("-", "_").split("_"))
+    for member in LawUserAction:
+        if member.name.lower() == pascal.lower():
+            return member
+    raise ValueError(f"unknown law action: {value!r}") from None
 
 
 def _path_id(path: str, collection: str) -> str:

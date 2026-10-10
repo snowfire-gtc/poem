@@ -251,24 +251,45 @@ class TurnEngine:
                                      title=law.title, strength=min(law.tradition, 1.0))
                     )
 
-            # Pass 2: price and attach each law's winning revision.
+            # Pass 2: attach each law's winning revision to the snapshot.
+            # Repeals are classified first (their laws leave the active set),
+            # then amendments are priced against the POST-repeal legal system
+            # (§13 step 13 must see the final norm configuration, §4.3).
+            deferred_repeal_pricing: list[tuple] = []
             for law in laws:
                 winner = winners.get(law.id)
                 if winner is None:
                     continue
-                # §13 step 13 (norm-conflict detection) feeds the §5.1
-                # contradiction_penalty term of the price shown to the
-                # player *before* submission (§16: "показывать стоимость").
-                # The prospective canonical form of the amendment is what
-                # conflicts with the rest of the legal system — if the
-                # revision carries a new canonical, it replaces the old one
-                # for conflict purposes.
+                self.store.mark_included(winner.id, turn.id)
+                if winner.action == LawUserAction.REPEAL_LAW:
+                    snap.pending_repeals.append(winner)
+                    deferred_repeal_pricing.append((law, winner))
+                    continue
+                if winner.action == LawUserAction.SUSPEND_LAW:
+                    if law.id not in snap.suspended_laws:
+                        snap.suspended_laws.append(law.id)
+                snap.pending_amendments.append(winner)
+
+            # Pass 3: price every included revision now that the snapshot's
+            # final active set is known.
+            # §13 step 13 (norm-conflict detection) feeds the §5.1
+            # contradiction_penalty term of the price shown to the player
+            # *before* submission (§16: "показывать стоимость"). The
+            # prospective canonical form of the amendment is what conflicts
+            # with the rest of the legal system — if the revision carries a
+            # new canonical, it replaces the old one for conflict purposes.
+            repealed_ids = {rev.law_id for _, rev in deferred_repeal_pricing}
+            for law in laws:
+                winner = winners.get(law.id)
+                if winner is None:
+                    continue
                 effective_canonical = (
                     winner.canonical_change.new_canonical
                     or law.canonical
                 )
                 contradictions = self._count_conflicts(
-                    law, snap, civ_id, prospective=effective_canonical)
+                    law, snap, civ_id, prospective=effective_canonical,
+                    revision_id=winner.id, exclude_active=repealed_ids)
                 winner.cost = cost_of_law_change(
                     law, winner.action, cfg=self.pricing_cfg,
                     scope_delta=len(winner.raw_text) / 500.0,
@@ -278,15 +299,6 @@ class TurnEngine:
                         if winner.canonical_change.transition else 0.0),
                     urgent=winner.canonical_change.urgent,
                 )
-                self.store.mark_included(winner.id, turn.id)
-                if winner.action in (LawUserAction.REPEAL_LAW,):
-                    snap.pending_repeals.append(winner)
-                elif winner.action == LawUserAction.SUSPEND_LAW:
-                    if law.id not in snap.suspended_laws:
-                        snap.suspended_laws.append(law.id)
-                    snap.pending_amendments.append(winner)
-                else:
-                    snap.pending_amendments.append(winner)
             snapshots.append(snap)
 
         turn.status = TurnStatus.SNAPSHOT_PREPARED
@@ -565,7 +577,8 @@ class TurnEngine:
     # ------------------------------------------------------------- internals
 
     def _count_conflicts(
-        self, law, snap: TurnLawSnapshot, civ_id: str, prospective=None
+        self, law, snap: TurnLawSnapshot, civ_id: str, prospective=None,
+        revision_id: str | None = None, exclude_active: set[str] | None = None,
     ) -> int:
         """§13 step 13 (norm-conflict detection), used for §5 pricing.
 
@@ -574,18 +587,59 @@ class TurnEngine:
         pays ``contradiction_penalty`` per conflict (§5.1). Deterministic and
         independent of wall-clock time. Detected conflicts are also recorded
         on the snapshot (§4.3 ``conflicts``) so clients can display them
-        (§16.2).
+        (§16.2). Each entry names the pending edit that creates the clash
+        (``revision_id``) so the UI can point at the exact amendment.
 
-        Two kinds of contradiction are recognised:
+        Three kinds of contradiction are recognised:
          * identical canonical kind — two laws regulating the same matter;
-         * conflicting kind pair (``kinds_conflict``, e.g. tax vs ban).
+         * conflicting kind pair (``kinds_conflict``, e.g. tax vs ban);
+         * an incoming REPEAL that removes a law another ACTIVE law still
+           depends on — repealing the enforcement norm while the obligation
+           norm survives is itself a legal-system contradiction (§5.1
+           «конфликт с другими законами»).
+
+        ``exclude_active`` lists laws that will be repealed within this very
+        snapshot: they must not count as conflict partners any more, because
+        step 13 evaluates against the FINAL norm configuration (§4.3).
         """
         from .core import kinds_conflict
 
         canon = prospective if prospective is not None else law.canonical
+        excluded = exclude_active or set()
         count = 0
+
+        # Repeal-dependency conflict: does any remaining active law reference
+        # this law (canonical refs or title mention)? Repealing it while the
+        # referencing law stays active produces a contradiction.
+        if revision_id is not None:
+            rev = None
+            from .laws import LawStoreError
+            try:
+                rev = self.store.get_revision(revision_id)
+            except (KeyError, LawStoreError):
+                rev = None
+            if rev is not None and rev.action == LawUserAction.REPEAL_LAW:
+                for other in snap.active_laws:
+                    if other.id == law.id or other.id in excluded:
+                        continue
+                    depends = (
+                        law.id in getattr(other.canonical, "refs", ())
+                        if other.canonical is not None else False
+                    ) or (bool(law.title) and law.title in other.raw_text)
+                    if depends:
+                        count += 1
+                        snap.conflicts.append(
+                            LawConflict(law_a=law.id, law_b=other.id,
+                                        revision_id=revision_id,
+                                        severity=0.75,
+                                        description=(
+                                            f"repealing {law.title!r} leaves "
+                                            f"{other.title!r} without its "
+                                            "referenced norm"))
+                        )
+
         for other in snap.active_laws:
-            if other.id == law.id:
+            if other.id == law.id or other.id in excluded:
                 continue
             if canon is not None and other.canonical is not None:
                 same_kind = other.canonical.kind == canon.kind
@@ -594,6 +648,7 @@ class TurnEngine:
                     count += 1
                     snap.conflicts.append(
                         LawConflict(law_a=law.id, law_b=other.id,
+                                    revision_id=revision_id,
                                     description=(
                                         "two active laws of the same kind"
                                         if same_kind else
@@ -605,6 +660,7 @@ class TurnEngine:
                 count += 1
                 snap.conflicts.append(
                     LawConflict(law_a=law.id, law_b=None, folklore_ref=rem.title,
+                                revision_id=revision_id,
                                 description="law contradicts a customary remnant")
                 )
         return count
