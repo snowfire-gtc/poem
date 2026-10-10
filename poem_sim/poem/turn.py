@@ -83,6 +83,7 @@ class TurnReport:
     expired_effects: list[str] = field(default_factory=list)
     economy: dict[str, dict[str, float]] = field(default_factory=dict)
     folklore: dict[str, dict[str, float]] = field(default_factory=dict)
+    admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
     notices: list[str] = field(default_factory=list)
 
 
@@ -339,6 +340,24 @@ class TurnEngine:
         for rev_id in applied:
             self.store.mark_applied(rev_id)
 
+        # §5, §11.4 — law-change cost is paid from the administrative budget
+        # that this turn's production accumulates (in GAME time). The cost
+        # formula itself never sees wall-clock time (§20.5): a change made at
+        # 03:00 costs exactly what the same change costs at 18:00.
+        admin_costs: dict[str, float] = {}
+        for snap in self._snapshot_list:
+            civ = self.civilizations.get(snap.civilization_id)
+            if civ is None:
+                continue
+            budget = economy[snap.civilization_id]["production"] + civ.administrative_budget
+            for rev in snap.pending_amendments + snap.pending_repeals:
+                law = self.store.get_law(rev.law_id)
+                c = cost_of_law_change(law, rev.action, cfg=self.pricing_cfg)
+                budget -= c
+                admin_costs.setdefault(snap.civilization_id, 0.0)
+                admin_costs[snap.civilization_id] += c
+            civ.administrative_budget = max(budget, 0.0)
+
         # Step 18: advance world chronology.
         era_before, era_after = advance_chronology(self.chronology, span, list(self.civilizations.values()))
         turn.status = TurnStatus.FINALIZING
@@ -380,6 +399,7 @@ class TurnEngine:
             expired_effects=expired,
             economy=economy,
             folklore=folklore,
+            admin_costs=admin_costs,
             notices=notices,
         )
 

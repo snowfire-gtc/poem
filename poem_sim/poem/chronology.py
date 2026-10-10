@@ -110,6 +110,9 @@ class Civilization:
     annual_research_rate: float = 0.0
     culture_modifier: float = 1.0
     technology_modifier: float = 1.0
+    # Administrative resource accumulated in game time; law-change costs (§5)
+    # are paid from it. Never affected by wall-clock time of day (§20.5).
+    administrative_budget: float = 0.0
 
 
 PROGRESS_ERA_THRESHOLDS: list[tuple[float, Era]] = [

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -217,3 +219,56 @@ def test_snapshot_refuses_before_cutoff():
         assert False, "snapshot must not be prepared before cutoff"
     except RuntimeError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# §5 — стоимость правок списывается в симуляции хода (не зависит от часов)
+# ---------------------------------------------------------------------------
+
+def test_law_change_cost_is_charged_from_admin_budget_in_turn():
+    """Applied revisions cost administrative resource, identical for edits
+    made at 03:00 and 18:00 within the same slice (§5.1: no late_edit term)."""
+    costs_by_hour = {}
+    for hour in (3, 18):
+        store, chrono, engine, civ, law = make_world()
+        civ.annual_production_rate = 100.0   # 25 y/turn -> 2500 budget inflow
+        rev = store.record_revision(
+            "law-tax", "c1", LawUserAction.AMEND_LAW, "Exempt small settlements.",
+            CanonicalLawChange(action=LawUserAction.AMEND_LAW,
+                               new_canonical=CanonicalLaw(kind="tax")),
+            now=DAY.replace(hour=hour))
+        engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+        report = engine.run_turn()
+        assert rev.id in report.applied_revisions
+        expected = cost_of_law_change(store.get_law("law-tax"),
+                                      LawUserAction.AMEND_LAW, cfg=PricingConfig())
+        assert report.admin_costs["c1"] == pytest.approx(expected)
+        assert civ.administrative_budget == pytest.approx(2500.0 - expected)
+        costs_by_hour[hour] = (report.admin_costs["c1"],
+                               store.get_revision(rev.id).status.value)
+    # time of day changes nothing (§17.1 extended to the application stage)
+    assert costs_by_hour[3] == costs_by_hour[18]
+
+
+def test_deferred_revision_not_charged_until_applied():
+    """A revision that misses the cutoff is preserved without any charge;
+    its cost hits only in the turn where it actually applies (§4.4, §5)."""
+    store, chrono, engine, civ, law = make_world()
+    civ.annual_production_rate = 100.0
+    late = store.record_revision(
+        "law-tax", "c1", LawUserAction.REPEAL_LAW, "Repeal after cutoff",
+        CanonicalLawChange(action=LawUserAction.REPEAL_LAW),
+        now=DAY.replace(hour=21))
+    engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=20))
+    report1 = engine.run_turn()
+    assert late.id in report1.deferred_revisions
+    assert report1.admin_costs.get("c1", 0.0) == 0.0   # nothing applied -> nothing charged
+
+    from datetime import timedelta
+    engine.open_turn(started_at=DAY + timedelta(days=1),
+                     simulation_cutoff_at=DAY + timedelta(days=1, hours=20))
+    report2 = engine.run_turn()
+    assert late.id in report2.applied_revisions
+    repeal_cost = cost_of_law_change(store.get_law("law-tax"),
+                                     LawUserAction.REPEAL_LAW, cfg=PricingConfig())
+    assert report2.admin_costs["c1"] == pytest.approx(repeal_cost)
