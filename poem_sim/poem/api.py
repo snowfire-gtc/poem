@@ -39,6 +39,17 @@ def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def _received_at(body: dict) -> datetime | None:
+    """Audit timestamp for a revision (§3.4 ``received_at``).
+
+    Accepts both spellings used by clients/tests — ``now`` and the canonical
+    ``received_at`` — so a supplied submission time is never silently ignored.
+    It is stored for audit only and never modifies cost or effectiveness
+    (TASK-060, §20.4).
+    """
+    return _parse_dt(body.get("now") or body.get("received_at"))
+
+
 class WorldServer:
     """Composition root for one world."""
 
@@ -148,7 +159,7 @@ class WorldServer:
                     if body.get("canonical_change", {}).get("transition") else None
                 ),
             ),
-            now=_parse_dt(body.get("now")),
+            now=_received_at(body),
         )
         notice = ACCEPTED_NOTICE + (
             "\nОна будет учтена в следующем ходе.\nШтрафа за время суток нет."
@@ -268,6 +279,71 @@ class WorldServer:
             "rejected": rejected,
             "failed": failed,
             "cutoff": cutoff.isoformat() if cutoff else None,
+            "note": "Время подачи правки не влияет на эффективность (TASK-060).",
+        }
+
+    def get_law_status(self, path: str, body: dict) -> dict:
+        """§16.3 — per-law edit status feed for the web client.
+
+        Answers exactly what the design doc requires to be shown next to an
+        edit ("Правка сохранена… Время подачи не влияет на эффективность"),
+        categorised against the *current turn's* logical cutoff (§4.1):
+
+         * included_in_current_snapshot — already joined this turn's slice;
+         * will_apply_this_slice        — confirmed before the cutoff;
+         * awaiting_next_turn           — made after the cutoff (preserved,
+           no penalty, §4.4);
+         * superseded                   — overwritten by a later version;
+         * rejected / failed            — server verdicts (§3.4).
+
+        Time of day is never part of any bucket or notice (§20.4).
+        """
+        from .core import LawRevisionStatus as LRS
+
+        law_id = _path_id(path, "laws")
+        law = self.store.get_law(law_id)          # raises -> 400 via handle()
+
+        turn = self.engine.current_turn
+        cutoff = turn.simulation_cutoff_at if turn else None
+        buckets: dict[str, list[dict]] = {
+            "included_in_current_snapshot": [],
+            "will_apply_this_slice": [],
+            "awaiting_next_turn": [],
+            "superseded": [],
+            "rejected": [],
+            "failed": [],
+        }
+        for rev in self.store.version_history(law_id):
+            payload = _revision_json(rev)
+            if rev.status == LRS.PENDING:
+                if cutoff is not None and rev.received_at > cutoff:
+                    buckets["awaiting_next_turn"].append(payload)
+                else:
+                    buckets["will_apply_this_slice"].append(payload)
+            elif rev.status == LRS.INCLUDED_IN_SIMULATION:
+                buckets["included_in_current_snapshot"].append(payload)
+            elif rev.status == LRS.SUPERSEDED:
+                buckets["superseded"].append(payload)
+            elif rev.status == LRS.REJECTED:
+                buckets["rejected"].append(payload)
+            elif rev.status == LRS.FAILED:
+                buckets["failed"].append(payload)
+            # APPLIED revisions are the official version history of the law
+            # itself (GET /api/v1/laws/{id}, §16.2), not a pending edit.
+
+        notices: list[str] = []
+        if buckets["will_apply_this_slice"] or buckets["included_in_current_snapshot"]:
+            notices.append(ACCEPTED_NOTICE)
+        if buckets["awaiting_next_turn"]:
+            notices.append(DEFERRED_NOTICE)
+
+        return {
+            "law_id": law_id,
+            "law_status": law.status.value,
+            "turn_open": turn is not None,
+            "cutoff": cutoff.isoformat() if cutoff else None,
+            **buckets,
+            "notices": notices,
             "note": "Время подачи правки не влияет на эффективность (TASK-060).",
         }
 
@@ -571,10 +647,55 @@ class WorldServer:
         self.engine.wars.append(war)
         return {"war_id": war.id, "started_year": war.started_year}
 
+    # ================= image task queue (§13 step 20) ======================
+
+    def list_image_tasks(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/images — poll illustration progress (§16)."""
+        status_filter = body.get("status")
+        tasks = [t.to_json() for t in self.engine.image_queue]
+        if status_filter:
+            tasks = [t for t in tasks if t["status"] == status_filter]
+        return {"tasks": tasks, "pending": sum(1 for t in tasks if t["status"] == "queued")}
+
+    def claim_image_task(self, path: str, body: dict) -> dict:
+        """POST /api/v1/images/{task_id}/claim — renderer takes one job.
+
+        queued -> running; claiming an already-running/finished task is a
+        no-op error so parallel renderers never double-process (§13 step 20).
+        """
+        task_id = _path_id(path, "images")
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                if t.status != "queued":
+                    raise ValueError(f"task {task_id} is not claimable (status={t.status})")
+                t.status = "running"
+                return {"task": t.to_json()}
+        raise ValueError(f"unknown image task: {task_id}")
+
+    def complete_image_task(self, path: str, body: dict) -> dict:
+        """POST /api/v1/images/{task_id}/complete — renderer reports verdict.
+
+        running -> done | failed, with the produced asset reference stored on
+        the task payload for the published report (§13 steps 20–22).
+        """
+        task_id = _path_id(path, "images")
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                if t.status != "running":
+                    raise ValueError(f"task {task_id} must be claimed first (status={t.status})")
+                success = bool(body.get("success", True))
+                t.status = "done" if success else "failed"
+                if body.get("asset_ref"):
+                    t.payload["asset_ref"] = body["asset_ref"]
+                return {"task": t.to_json()}
+        raise ValueError(f"unknown image task: {task_id}")
+
     _ROUTES: dict = {}
 
 
-def Treaty_as_effect(body: dict) -> TimedEffect:
+def treaty_as_effect(body: dict) -> TimedEffect:
+    """§11.6: a treaty is stored as a timed effect whose duration lives in
+    GAME time (years), never in a number of turns."""
     import uuid
 
     return TimedEffect(
@@ -585,6 +706,10 @@ def Treaty_as_effect(body: dict) -> TimedEffect:
         remaining=SimDuration(years=float(body["duration_years"])),
         payload={"treaty_kind": body.get("kind", "peace")},
     )
+
+
+# Backwards-compatible alias for the previous internal spelling.
+Treaty_as_effect = treaty_as_effect
 
 
 def _normalize_path(path: str) -> str:
@@ -599,12 +724,12 @@ def _normalize_path(path: str) -> str:
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
-                 "wars",
+                 "wars", "status", "images", "claim", "complete",
                  "civilizations", "cost_preview"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
-    return prev in {"laws", "drafts", "revisions", "worlds", "treaties"}
+    return prev in {"laws", "drafts", "revisions", "worlds", "treaties", "images"}
 
 
 def _parse_action(value: str) -> LawUserAction:
@@ -691,6 +816,9 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/submit$", WorldServer.submit_revision),
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/cancel$", WorldServer.cancel_revision),
     ("GET", r"^/api/v1/laws/pending$", WorldServer.get_pending),
+    # §16.3: статус правок конкретного закона (в каком ходу будет учтена,
+    # перезаписана ли, отклонена; без штрафов за время подачи).
+    ("GET", r"^/api/v1/laws/[^/]+/status$", WorldServer.get_law_status),
     # §4.3: снимок активных законов, который читает симуляция (инспектируется
     # клиентом; правки со статусом IncludedInSimulation уже вошли в него).
     ("GET", r"^/api/v1/laws/snapshot$", WorldServer.get_snapshot),
@@ -705,6 +833,10 @@ _ROUTE_TABLE = [
     ("GET", r"^/api/v1/laws/[^/]+$", WorldServer.get_law_detail),
     ("POST", r"^/api/v1/treaties$", WorldServer.add_treaty),
     ("POST", r"^/api/v1/wars$", WorldServer.declare_war),
+    # §13 step 20: иллюстрации хроники — очередь задач на генерацию.
+    ("GET", r"^/api/v1/worlds/\{id\}/images$", WorldServer.list_image_tasks),
+    ("POST", r"^/api/v1/images/\{id\}/claim$", WorldServer.claim_image_task),
+    ("POST", r"^/api/v1/images/\{id\}/complete$", WorldServer.complete_image_task),
 ]
 
 WorldServer._ROUTES = {

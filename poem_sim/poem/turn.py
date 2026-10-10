@@ -139,6 +139,11 @@ class TurnEngine:
         # §15.3: last prepared snapshot, readable by the API even after the
         # turn has been finalized (until the next prepare_snapshot overwrites).
         self.last_snapshots: list[TurnLawSnapshot] = []
+        # §13 step 20: server-side queue of chronicle illustration tasks.
+        # Tasks are created when a turn finalizes and transition
+        # queued -> running -> done/failed as renderers claim them; they are
+        # kept until acknowledged so clients can poll progress (§16).
+        self.image_queue: list = []
 
     # ------------------------------------------------------------------ turns
 
@@ -557,10 +562,14 @@ class TurnEngine:
             )
         if era_after != era_before:
             next_span = calculate_turn_span(self.chronology, list(self.civilizations.values()))
-            notices.append(
-                f"Внимание: благодаря развитию цивилизаций следующий ход охватит "
-                f"{next_span.years:g} лет вместо {span.years:g}."
-            )
+            # §16.1 — the warning is only meaningful when the interval actually
+            # changed; an era shift with identical span must not emit a noisy
+            # (and non-deterministic-looking) notice.
+            if next_span.years != span.years:
+                notices.append(
+                    f"Внимание: благодаря развитию цивилизаций следующий ход охватит "
+                    f"{next_span.years:g} лет вместо {span.years:g}."
+                )
 
         report = TurnReport(
             turn_id=turn.id,
@@ -600,7 +609,11 @@ class TurnEngine:
         # report, then queue chronicle illustration tasks derived from them.
         report.view = build_turn_view(
             report, self.chronology, list(self.civilizations.values()))
-        report.image_tasks = [t.to_json() for t in queue_image_tasks(report.view, self.world_id)]
+        tasks = queue_image_tasks(report.view, self.world_id)
+        # §13 step 20: keep the created tasks server-side so renderers can
+        # claim/complete them and clients can poll progress via the API.
+        self.image_queue.extend(tasks)
+        report.image_tasks = [t.to_json() for t in tasks]
 
         return report
 
