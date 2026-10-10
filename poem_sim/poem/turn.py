@@ -609,13 +609,18 @@ class TurnEngine:
                     years = rev.canonical_change.suspend_years or max(
                         self.chronology.seasons_per_year and 1.0, 1.0
                     )
-                    self.timed_effects.append(TimedEffect(
+                    # §4.2 example: "приостановить закон на один сезон" — the
+                    # suspension clock runs in GAME time (§11.7/§20.9): the
+                    # requested duration is interpreted directly in years.
+                    eff = TimedEffect(
                         id=str(uuid.uuid4()), world_id=self.world_id,
                         civilization_id=law.civilization_id,
                         kind=TimedEffectKind.SUSPENSION,
                         remaining=SimDuration(years=years),
                         payload={"law_id": law.id},
-                    ))
+                    )
+                    self.timed_effects.append(eff)
+                    snap.suspended_laws.append(law.id)   # §4.3 snapshot field
                 case LawUserAction.REINSTATE_LAW:
                     law.status = LawStatus.ACTIVE
                 case LawUserAction.AMEND_LAW | LawUserAction.SUBMIT_DRAFT:

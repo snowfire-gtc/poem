@@ -171,7 +171,8 @@ def test_api_treaty_stored_in_game_time():
                       {"world_id": "w1", "civilization_id": "c1",
                        "duration_years": 100, "kind": "peace"})
     assert resp["duration_years"] == 100.0
-    eff = srv.timed_effects[0]
+    # the live effect list is owned by the engine (it rebinds on turn tick)
+    eff = srv.engine.timed_effects[0]
     assert eff.remaining.years == 100.0   # game time, not turn count
 
 
