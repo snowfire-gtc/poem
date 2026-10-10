@@ -86,6 +86,8 @@ class TurnReport:
     folklore: dict[str, dict[str, float]] = field(default_factory=dict)
     admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
     notices: list[str] = field(default_factory=list)
+    view: dict = field(default_factory=dict)                      # §13 step 19
+    image_tasks: list[dict] = field(default_factory=list)         # §13 step 20
 
 
 class TurnEngine:
@@ -298,6 +300,11 @@ class TurnEngine:
             research = research_progress_this_turn(
                 civ.annual_research_rate, span, civ.culture_modifier, civ.technology_modifier
             )
+            # §11.3: accumulated research advances the civilization's
+            # development index (0..1), which drives era determination (§9)
+            # and therefore the Civilization-like turn interval (§6.2).
+            if civ.annual_research_rate > 0.0:
+                civ.progress = min(1.0, civ.progress + research * civ.research_to_progress)
             economy[civ.id] = {
                 "production": prod,
                 "population_growth": growth,
@@ -411,7 +418,7 @@ class TurnEngine:
                 f"{next_span.years:g} лет вместо {span.years:g}."
             )
 
-        return TurnReport(
+        report = TurnReport(
             turn_id=turn.id,
             turn_number=turn.number,
             era_before=era_before,
@@ -430,6 +437,16 @@ class TurnEngine:
             admin_costs=admin_costs,
             notices=notices,
         )
+
+        # Steps 19–20 (§13): generate client representations from the finalized
+        # report, then queue chronicle illustration tasks derived from them.
+        from .views import build_turn_view, queue_image_tasks
+
+        report.view = build_turn_view(
+            report, self.chronology, list(self.civilizations.values()))
+        report.image_tasks = [t.to_json() for t in queue_image_tasks(report.view, self.world_id)]
+
+        return report
 
     # ------------------------------------------------------------- internals
 

@@ -48,6 +48,8 @@ class WorldServer:
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
         self.civilizations: dict[str, Civilization] = {}
         self.timed_effects: list[TimedEffect] = []
+        # Published turn reports (§13 step 22); the client fetches the last one.
+        self.published_reports: list[dict] = []
         self.engine = TurnEngine(
             world_id, self.store, self.chronology, [], timed_effects=self.timed_effects
         )
@@ -276,7 +278,9 @@ class WorldServer:
 
     def run_turn(self, path: str, body: dict) -> dict:
         report = self.engine.run_turn()
-        return {
+        # Publish the turn report (§13 step 22): raw numbers plus the
+        # generated client view and queued illustration tasks.
+        result = {
             "turn_number": report.turn_number,
             "years_elapsed": report.years_elapsed,
             "era_before": report.era_before.value,
@@ -289,7 +293,18 @@ class WorldServer:
             "expired_effects": report.expired_effects,
             "economy": report.economy,
             "notices": report.notices,
+            "admin_costs": report.admin_costs,
+            "view": report.view,
+            "image_tasks": report.image_tasks,
         }
+        self.published_reports.append(result)
+        return result
+
+    def get_turn_report(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/turns/report — last published report (§16)."""
+        if not self.published_reports:
+            return {"report": None}
+        return {"report": self.published_reports[-1]}
 
     def list_laws(self, path: str, body: dict) -> dict:
         civ = body.get("civilization_id")
@@ -306,8 +321,10 @@ class WorldServer:
         }
 
     def create_law(self, path: str, body: dict) -> dict:
+        import uuid as _uuid
+
         law = Law(
-            id=body["id"],
+            id=body.get("id") or str(_uuid.uuid4()),
             civilization_id=body["civilization_id"],
             title=body["title"],
             raw_text=body["raw_text"],
@@ -316,7 +333,8 @@ class WorldServer:
             administrative_load=body.get("administrative_load", 1.0),
         )
         self.store.add_law(law)
-        return {"law_id": law.id}
+        return {"law": {"id": law.id, "title": law.title, "status": law.status.value},
+                "law_id": law.id}
 
     def add_treaty(self, path: str, body: dict) -> dict:
         eff = Treaty_as_effect(body)
@@ -351,7 +369,7 @@ def _normalize_path(path: str) -> str:
 
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
-                 "turns", "api", "v1", "submit", "cancel", "treaties",
+                 "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "civilizations", "cost_preview"}
     if token in known_ids:
         return False
@@ -426,6 +444,7 @@ _ROUTE_TABLE = [
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),
+    ("GET", r"^/api/v1/worlds/\{id\}/turns/report$", WorldServer.get_turn_report),
     ("GET", r"^/api/v1/laws$", WorldServer.list_laws),
     ("POST", r"^/api/v1/laws$", WorldServer.create_law),
     ("POST", r"^/api/v1/treaties$", WorldServer.add_treaty),

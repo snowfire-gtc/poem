@@ -113,6 +113,9 @@ class Civilization:
     # Administrative resource accumulated in game time; law-change costs (§5)
     # are paid from it. Never affected by wall-clock time of day (§20.5).
     administrative_budget: float = 0.0
+    # §11.3: how much one unit of research progress raises the development
+    # index (progress, 0..1) that determines the world era (§9).
+    research_to_progress: float = 1e-4
 
 
 PROGRESS_ERA_THRESHOLDS: list[tuple[float, Era]] = [
