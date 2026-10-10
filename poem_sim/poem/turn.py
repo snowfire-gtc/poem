@@ -93,6 +93,8 @@ class TurnReport:
     wars: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 17
     admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
     notices: list[str] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)              # §19.1 chronicle
+    expired_effect_details: list[dict] = field(default_factory=list)  # for events
     view: dict = field(default_factory=dict)                      # §13 step 19
     image_tasks: list[dict] = field(default_factory=list)         # §13 step 20
 
@@ -341,10 +343,20 @@ class TurnEngine:
         # turn (§11.7 — transitions finish on later turns' ticks).
         pre_turn_effects = self._pre_turn_effect_ids
         expired: list[str] = []
+        expired_details: list[dict] = []
         survivors: list[TimedEffect] = []
         for eff in self.timed_effects:
             if eff.id in pre_turn_effects and eff.tick(span):
                 expired.append(eff.id)
+                # §19.1: keep enough detail to render the expiry as a
+                # chronicle entry (kind + human-readable subject).
+                expired_details.append({
+                    "effect_id": eff.id,
+                    "kind": eff.kind.value,
+                    "detail": str(eff.payload.get("law_id")
+                                  or eff.payload.get("treaty_kind")
+                                  or eff.payload.get("destination", "")),
+                })
                 self._on_effect_expired(eff)
             else:
                 survivors.append(eff)
@@ -519,12 +531,20 @@ class TurnEngine:
             wars=wars,
             admin_costs=admin_costs,
             notices=notices,
+            expired_effect_details=expired_details,
         )
+
+        # §19.1: build the turn chronicle ("events for the interval") BEFORE
+        # the view, so clients receive intermediate cultural milestones and
+        # key events instead of a bare time jump.
+        from .views import (
+            build_turn_view, interval_events, queue_image_tasks)
+
+        report.events = [e.to_json() for e in
+                         interval_events(report, turn.world_year_before)]
 
         # Steps 19–20 (§13): generate client representations from the finalized
         # report, then queue chronicle illustration tasks derived from them.
-        from .views import build_turn_view, queue_image_tasks
-
         report.view = build_turn_view(
             report, self.chronology, list(self.civilizations.values()))
         report.image_tasks = [t.to_json() for t in queue_image_tasks(report.view, self.world_id)]

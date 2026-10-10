@@ -390,6 +390,40 @@ class Treaty(TimedEffect):
 
 
 # ---------------------------------------------------------------------------
+# Interval events — chronicle of what happened during one turn span (§19.1)
+# ---------------------------------------------------------------------------
+
+# A turn shorter than this produces no intermediate cultural milestones:
+# small yearly processes are not faked frame-by-frame (§19.1).
+MIN_EVENT_SPAN_YEARS = 5.0
+# Approximate spacing of generated culture/folklore milestones inside a long
+# interval, so 40-year ancient turns read as a chronicle, not a time jump.
+EVENT_INTERVAL_YEARS = 25.0
+
+
+@dataclass
+class IntervalEvent:
+    """A chronicle entry covering the whole turn interval (§19.1).
+
+    Key events (era change, treaty expiry, law repeal/suspension, envoy
+    arrival) always appear; additionally, evenly spaced cultural-folklore
+    milestones are generated inside long intervals so that players do not
+    feel entire decades were skipped. Generation is deterministic in game
+    time — wall-clock time of day never influences it (§20.4).
+    """
+
+    kind: str            # EraChange | Suspension | Repeal | TreatyExpired |
+                         # TravelArrival | TransitionEnd | CulturalMilestone
+    year: float          # world year at which the event is placed
+    title: str
+    detail: str = ""
+
+    def to_json(self) -> dict:
+        return {"kind": self.kind, "year": round(self.year, 2),
+                "title": self.title, "detail": self.detail}
+
+
+# ---------------------------------------------------------------------------
 # Turn (§12)
 # ---------------------------------------------------------------------------
 

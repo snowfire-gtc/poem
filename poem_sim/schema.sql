@@ -115,3 +115,17 @@ CREATE TABLE IF NOT EXISTS wars (
     fatigue_defender DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     annual_fatigue_rate DOUBLE PRECISION NOT NULL DEFAULT 0.01
 );
+
+-- Interval events (§19.1): the chronicle of one turn span. Key events and
+-- intermediate cultural milestones are stored per turn so long intervals
+-- read as a story instead of a time jump. `year` is WORLD (game) time;
+-- generation never depends on real-world time of day (§20.4).
+CREATE TABLE IF NOT EXISTS interval_events (
+    id UUID PRIMARY KEY,
+    world_id UUID NOT NULL,
+    turn_id UUID NOT NULL,
+    kind TEXT NOT NULL,
+    year DOUBLE PRECISION NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);

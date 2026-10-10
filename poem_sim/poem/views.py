@@ -124,12 +124,103 @@ def build_turn_view(report, chronology, civilizations) -> dict:
         "deferred_revisions": report.deferred_revisions,
         "superseded_revisions": report.superseded_revisions,
         "expired_effects": report.expired_effects,
+        "events": getattr(report, "events", []),   # §19.1 chronicle
         "notices": list(report.notices),
     }
 
 
+# ---------------------------------------------------------------------------
+# Interval events — chronicle entries covering one turn span (§19.1, §13 step 19)
+# ---------------------------------------------------------------------------
+
+# Rotating deterministic templates for cultural milestones. Selection depends
+# only on the world year (game time), never on wall-clock time (§20.4).
+_MILESTONE_TITLES = (
+    "Смена поколений устных рассказчиков",
+    "Новые песни о старых законах",
+    "Праздник урожая в главных поселениях",
+    "Летописцы фиксируют обычаи округи",
+    "Мастеровые гильдии передают ремесло детям",
+)
+
+
+def interval_events(report, world_year_before: float) -> list:
+    """Build the turn's chronicle (§19.1).
+
+    Key events always appear as chronicle entries: era change, repealed or
+    suspended laws, expired treaties/transitions/envoy arrivals. For long
+    intervals, evenly spaced culture/folklore milestones are added so that a
+    40-year ancient turn reads as a story instead of a time jump; short turns
+    (< MIN_EVENT_SPAN_YEARS) get none — small yearly processes are not faked
+    frame-by-frame ("не все процессы масштабировать линейно").
+    """
+    from .core import (
+        EVENT_INTERVAL_YEARS,
+        IntervalEvent,
+        MIN_EVENT_SPAN_YEARS,
+        TimedEffectKind,
+    )
+
+    events: list[IntervalEvent] = []
+    end_year = world_year_before + report.years_elapsed
+
+    # --- key events -------------------------------------------------------
+    if report.era_after != report.era_before:
+        events.append(IntervalEvent(
+            kind="EraChange", year=end_year,
+            title=f"Наступает {_era_label(report.era_after.value)} эпоха",
+            detail=f"Мир переходит от {_era_label(report.era_before.value)} "
+                   f"к {_era_label(report.era_after.value)}."))
+
+    for snap in report.snapshots:
+        for rev in snap.pending_repeals:
+            events.append(IntervalEvent(
+                kind="Repeal", year=end_year,
+                title="Закон отменён",
+                detail=f"{rev.raw_text[:80]}"))
+        for law_id in snap.suspended_laws:
+            events.append(IntervalEvent(
+                kind="Suspension", year=end_year,
+                title="Закон приостановлен",
+                detail=f"law {law_id}: действие заморожено на переходный срок"))
+
+    for eff in getattr(report, "expired_effect_details", []):
+        kind = eff["kind"]
+        year = min(max(eff.get("year", end_year), world_year_before), end_year)
+        if kind == TimedEffectKind.TREATY.value:
+            events.append(IntervalEvent(kind="TreatyExpired", year=year,
+                                        title="Договор истёк",
+                                        detail=eff.get("detail", "")))
+        elif kind == TimedEffectKind.TRAVEL.value:
+            events.append(IntervalEvent(kind="TravelArrival", year=year,
+                                        title="Посол прибыл",
+                                        detail=eff.get("detail", "")))
+        elif kind == TimedEffectKind.LAW_TRANSITION.value:
+            events.append(IntervalEvent(kind="TransitionEnd", year=year,
+                                        title="Переходный период завершён",
+                                        detail=eff.get("detail", "")))
+
+    # --- intermediate cultural milestones (long intervals only) -----------
+    if report.years_elapsed >= MIN_EVENT_SPAN_YEARS:
+        n_milestones = int(report.years_elapsed // EVENT_INTERVAL_YEARS)
+        # cap density: even marathon-speed ancient turns stay readable
+        n_milestones = min(n_milestones, max(1, int(report.years_elapsed // 20)))
+        for i in range(1, n_milestones + 1):
+            frac = i / (n_milestones + 1)
+            year = round(world_year_before + report.years_elapsed * frac, 1)
+            idx = int(year) % len(_MILESTONE_TITLES)
+            events.append(IntervalEvent(
+                kind="CulturalMilestone", year=year,
+                title=_MILESTONE_TITLES[idx],
+                detail="Промежуточная веха фольклора и культуры за этот ход"))
+
+    events.sort(key=lambda e: (e.year, e.kind))
+    return events
+
+
 def render_dashboard_text(view: dict) -> str:
-    """Plain-text dashboard block in the exact shape of §16.1."""
+    """Plain-text dashboard block in the exact shape of §16.1, followed by
+    the turn chronicle (§19.1: key events shown as a chronicle)."""
     d = view["dashboard"]
     lines = [
         f"Ход: {d['turn']}",
@@ -141,6 +232,11 @@ def render_dashboard_text(view: dict) -> str:
     for notice in view.get("notices", []):
         if notice.startswith("Внимание"):
             lines.append(notice)
+    events = view.get("events") or []
+    if events:
+        lines.append("Хроника хода:")
+        for ev in events:
+            lines.append(f"[{ev['year']:g}] {ev['title']} — {ev['detail']}")
     return "\n".join(lines)
 
 
