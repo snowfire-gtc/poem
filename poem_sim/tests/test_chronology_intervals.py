@@ -325,7 +325,7 @@ def test_envoy_travel_expires_by_game_time_not_turn_count():
     t_ancient = travel(5.0)
     assert t_ancient.tick(calculate_turn_span(chrono, [ancient_civ]))  # 1 turn
 
-    modern_civ = Civilization(id="a", progress=0.75)    # modern: 2 y/turn
+    modern_civ = Civilization(id="a", progress=0.80)    # modern: 2 y/turn
     assert calculate_turn_span(chrono, [modern_civ]).years == 2.0
     t_modern = travel(5.0)
     arrivals = 0
