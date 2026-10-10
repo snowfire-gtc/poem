@@ -129,3 +129,18 @@ CREATE TABLE IF NOT EXISTS interval_events (
     title TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT ''
 );
+
+-- Image-generation task queue (§13 step 20). Tasks are created server-side
+-- when a turn finalizes (one chronicle hero image + vignettes per applied
+-- law revision) and progress queued -> running -> done/failed as renderers
+-- claim and complete them. `turn_id` links the illustration to its published
+-- report; asset_ref is filled on completion. No real-world timing affects
+-- generation (§20.4).
+CREATE TABLE IF NOT EXISTS image_tasks (
+    id UUID PRIMARY KEY,
+    world_id UUID NOT NULL,
+    turn_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    payload JSONB NOT NULL DEFAULT '{}'
+);
