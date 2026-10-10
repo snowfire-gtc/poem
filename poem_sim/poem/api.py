@@ -23,6 +23,7 @@ from .core import (
     LawStatus,
     LawUserAction,
     SimDuration,
+    SeasonId,
     TimedEffect,
     TimedEffectKind,
     War,
@@ -46,9 +47,14 @@ class WorldServer:
         world_id: str,
         game_speed: GameSpeed = GameSpeed.STANDARD,
         era_source: EraSource = EraSource.MEDIAN_ACTIVE_CIVILIZATIONS,
+        season: SeasonId | None = None,
     ) -> None:
         self.store = LawStore()
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
+        if season is not None:
+            # Setting-specific calendar (alien planet, §7.2): e.g. a world
+            # whose year begins with LONG_NIGHT (§15.4 sample response).
+            self.chronology.current_season = season
         self.civilizations: dict[str, Civilization] = {}
         self.timed_effects: list[TimedEffect] = []
         # Published turn reports (§13 step 22); the client fetches the last one.
@@ -151,13 +157,59 @@ class WorldServer:
         return {"revision": _revision_json(rev), "notice": notice}
 
     def submit_revision(self, path: str, body: dict) -> dict:
+        """POST /api/v1/laws/{id}/revisions/{revision_id}/submit (§15.2).
+
+        Three roles, mirroring §3.2/§3.3 (``LawUserAction.SubmitDraft``):
+
+        * ``{"draft_id": ...}`` in the body — convert a server-side draft
+          into an official revision (validated drafts only, §3.3); the
+          created revision is Pending and its turn is decided by the
+          logical cutoff alone (§4.1), never by time of day (§2).
+        * ``{"reject_reason": ...}`` — validation verdict Rejected (§3.4):
+          the revision is removed from future slices, kept in history for
+          audit (§16.2 version list) and reported via GET /laws/pending
+          (§15.3 «какие отклонены»).
+        * otherwise — confirm an already-recorded revision: it stays
+          Pending; the cutoff decides whether it joins this or the next
+          slice (§4.4). No penalty either way.
+        """
         law_id = _path_id(path, "laws")
         revision_id = _path_id(path, "revisions")
-        rev = self.store.get_revision(revision_id)
-        if rev.law_id != law_id:
-            raise ValueError("revision does not belong to law")
+        draft_id = body.get("draft_id")
+        reject_reason = body.get("reject_reason")
+        if draft_id is not None:
+            rev = self.store.submit_draft(draft_id, now=_parse_dt(body.get("now")))
+            if rev.law_id != law_id:
+                raise ValueError("draft targets another law")
+        elif reject_reason is not None:
+            rev = self.store.get_revision(revision_id)
+            if rev.law_id != law_id:
+                raise ValueError("revision does not belong to law")
+            if rev.status.value != "Pending":
+                raise ValueError(
+                    f"only Pending revisions can be rejected "
+                    f"(current status: {rev.status.value})")
+            self.store.mark_rejected(revision_id, reason=str(reject_reason))
+            return {
+                "revision": _revision_json(self.store.get_revision(revision_id)),
+                "notice": (
+                    "Правка отклонена при валидации.\n"
+                    "Она сохранена в истории версий для аудита и не будет "
+                    "учтена ни в одном ходе."
+                ),
+            }
+        else:
+            rev = self.store.get_revision(revision_id)
+            if rev.law_id != law_id:
+                raise ValueError("revision does not belong to law")
         # "Submit" here = confirm inclusion attempt; cutoff decides the turn.
-        return {"revision": _revision_json(rev), "notice": ACCEPTED_NOTICE}
+        return {
+            "revision": _revision_json(rev),
+            "notice": ACCEPTED_NOTICE + (
+                "\nОна будет учтена в следующем ходе.\nШтрафа за время суток нет."
+                if rev.deferred_to_next_turn else ""
+            ),
+        }
 
     def cancel_revision(self, path: str, body: dict) -> dict:
         revision_id = _path_id(path, "revisions")
@@ -186,7 +238,8 @@ class WorldServer:
 
         turn = self.engine.current_turn
         cutoff = turn.simulation_cutoff_at if turn else None
-        will_apply, in_snapshot, deferred, superseded, rejected = [], [], [], [], []
+        will_apply, in_snapshot, deferred, superseded, rejected, failed = \
+            [], [], [], [], [], []
         for rev in self.store._revisions.values():
             payload = _revision_json(rev)
             if rev.status == LRS.PENDING:
@@ -200,6 +253,10 @@ class WorldServer:
                 superseded.append(payload)        # перезаписана более поздней
             elif rev.status == LRS.REJECTED:
                 rejected.append(payload)
+            elif rev.status == LRS.FAILED:
+                # §3.4 Failed — applied-attempt raised during simulation;
+                # kept visible so the player learns the verdict (§15.3).
+                failed.append(payload)
             # APPLIED revisions are already part of the law's official
             # version history (GET /api/v1/laws/{id}); they are neither
             # pending nor "in this turn's snapshot" anymore (§3.4 statuses).
@@ -209,6 +266,7 @@ class WorldServer:
             "awaiting_next_turn": deferred,
             "superseded": superseded,
             "rejected": rejected,
+            "failed": failed,
             "cutoff": cutoff.isoformat() if cutoff else None,
             "note": "Время подачи правки не влияет на эффективность (TASK-060).",
         }
@@ -266,12 +324,24 @@ class WorldServer:
 
         contradictions = self._count_preview_conflicts(
             law, new_canonical or law.canonical, action=action)
+        # §5 «уровень бюрократии»: same input as snapshot pricing — the civ's
+        # FINAL active norm set. The engine prices amendments against the
+        # post-repeal configuration (§13 step 13), so a prospective REPEAL
+        # removes its own law from the bureaucratic load already at preview
+        # time: after repeal the law is no longer administered. Without this
+        # exclusion preview and charge drift by one bureaucracy step.
+        active_laws = [
+            l for l in self.store.laws_of(law.civilization_id)
+            if l.status.value in ("active", "in_transition")
+            and not (action == LawUserAction.REPEAL_LAW and l.id == law.id)
+        ]
         cost = cost_of_law_change(
             law, action, cfg=self.engine.pricing_cfg,
             scope_delta=scope_delta,
             contradictions=contradictions,
             transition_years=transition_years,
             urgent=urgent,
+            active_laws=active_laws,
         )
         return {
             "estimated_cost": cost,

@@ -173,14 +173,46 @@ _SEASON_CYCLE: tuple[SeasonId, ...] = (
     SeasonId.WINTER,
 )
 
+# Setting-specific season names (the world may be an alien planet, §7.2):
+# they are valid members of the calendar cycle and must survive ticks.
+_SETTING_SEASONS: dict[SeasonId, tuple[SeasonId, ...]] = {
+    SeasonId.LONG_NIGHT: (
+        SeasonId.LONG_NIGHT,   # cold half-year
+        SeasonId.SPRING,       # thaw
+        SeasonId.SUMMER,       # long light
+        SeasonId.AUTUMN,       # harvest
+    ),
+}
 
-def advance_season(season: SeasonId, delta_seasons: float, cycle: int = 4) -> SeasonId:
+
+def season_cycle_for(chronology: WorldChronology) -> tuple[SeasonId, ...]:
+    """The ordered season cycle actually used by this world (§7.1)."""
+    return _SETTING_SEASONS.get(chronology.current_season, _SEASON_CYCLE)
+
+
+def advance_season(
+    season: SeasonId,
+    delta_seasons: float,
+    cycle: int | tuple[SeasonId, ...] = 4,
+) -> SeasonId:
+    """Advance a season position by ``delta_seasons`` game seasons (§10.2).
+
+    ``cycle`` may be either a length hint (int) or the explicit ordered
+    season cycle; setting-specific cycles (e.g. starting at LONG_NIGHT)
+    rotate within their own list instead of collapsing to earth names.
+    """
+    if isinstance(cycle, tuple):
+        table = cycle if cycle else _SEASON_CYCLE
+    else:
+        table = _SETTING_SEASONS.get(season, _SEASON_CYCLE)
+        if isinstance(cycle, int) and cycle > 0:
+            table = table[: max(1, min(cycle, len(table)))]
     try:
-        idx = _SEASON_CYCLE.index(season)
+        idx = table.index(season)
     except ValueError:
-        idx = 0  # setting-specific seasons (e.g. LONG_NIGHT) map into the cycle
-    new_idx = (idx + int(delta_seasons)) % min(cycle, len(_SEASON_CYCLE))
-    return _SEASON_CYCLE[new_idx]
+        idx = 0  # foreign season maps into the cycle head
+    new_idx = (idx + int(delta_seasons)) % len(table)
+    return table[new_idx]
 
 
 @dataclass
@@ -238,7 +270,7 @@ def advance_chronology(
     chronology.current_season = advance_season(
         chronology.current_season,
         span.seasons if span.seasons else span.years * chronology.seasons_per_year,
-        cycle=chronology.seasons_per_year,
+        cycle=season_cycle_for(chronology),
     )
     chronology.current_turn += 1
     chronology.current_era = determine_world_era(chronology, civilizations)

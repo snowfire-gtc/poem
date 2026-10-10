@@ -86,6 +86,7 @@ class TurnReport:
     deferred_revisions: list[str] = field(default_factory=list)
     superseded_revisions: list[str] = field(default_factory=list)
     expired_effects: list[str] = field(default_factory=list)
+    failed_revisions: dict[str, str] = field(default_factory=dict)  # §3.4 Failed
     economy: dict[str, dict[str, float]] = field(default_factory=dict)
     folklore: dict[str, dict[str, float]] = field(default_factory=dict)
     prejudices: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 15
@@ -298,6 +299,9 @@ class TurnEngine:
                         winner.canonical_change.transition.years
                         if winner.canonical_change.transition else 0.0),
                     urgent=winner.canonical_change.urgent,
+                    # §5 «уровень бюрократии»: the civ's own active norm set
+                    # (final config of this snapshot) strains administration.
+                    active_laws=snap.active_laws,
                 )
             snapshots.append(snap)
 
@@ -327,8 +331,9 @@ class TurnEngine:
         # effects created by this turn's laws are not ticked/expired now.
         self._pre_turn_effect_ids = {e.id for e in self.timed_effects}
         applied: list[str] = []
+        failed: dict[str, str] = {}   # revision_id -> error (§3.4 Failed)
         for snap in self._snapshot_list:
-            self._apply_snapshot_changes(snap, applied)
+            self._apply_snapshot_changes(snap, applied, failed)
 
         # Steps 8–10: time-scaled systems (§11.1–11.3).
         economy: dict[str, dict[str, float]] = {}
@@ -444,6 +449,12 @@ class TurnEngine:
             rev = self.store.get_revision(rev_id)
             if rev.action == LawUserAction.REPEAL_LAW:
                 remnant_topics.add(rev.law_id)
+        # A FAILED repeal (§3.4) did not actually remove the law, so it must
+        # not linger in folk memory as a customary remnant.
+        for rev_id in failed:
+            rev = self.store.get_revision(rev_id)
+            if rev.action == LawUserAction.REPEAL_LAW:
+                remnant_topics.discard(rev.law_id)
         folklore: dict[str, dict[str, float]] = {}
         for item in self.folklore:
             if item.topic in remnant_topics and item.conflict_factor <= 0.0:
@@ -482,9 +493,14 @@ class TurnEngine:
             for p in self.prejudices
         }
 
-        # Mark included revisions as Applied.
+        # Mark included revisions as Applied (successful applications only).
         for rev_id in applied:
             self.store.mark_applied(rev_id)
+        # §3.4 Failed — a revision that joined the slice but whose
+        # application raised is marked Failed and stays in history; it is
+        # never charged (§5) and never silently retried.
+        for rev_id, err in failed.items():
+            self.store.mark_failed(rev_id, reason=err)
 
         # §5, §11.4 — law-change cost is paid from the administrative budget
         # that this turn's production accumulates (in GAME time). The cost
@@ -497,6 +513,10 @@ class TurnEngine:
                 continue
             budget = economy[snap.civilization_id]["production"] + civ.administrative_budget
             for rev in snap.pending_amendments + snap.pending_repeals:
+                if rev.id in failed:
+                    # §3.4: a revision that FAILED to apply is not charged —
+                    # the player pays only for changes that actually happen.
+                    continue
                 # Charge the EXACT price computed at snapshot time (§5.1):
                 # same inputs (law state, scope_delta, detected norm
                 # conflicts) as the preview shown to the player before
@@ -526,6 +546,15 @@ class TurnEngine:
         notices: list[str] = []
         if self._deferred_list:
             notices.append(DEFERRED_NOTICE)
+        if failed:
+            # §3.4/§16.3 — the player is told explicitly which edit failed to
+            # apply; it is preserved in history, never charged, and does NOT
+            # silently retry next turn.
+            ids = ", ".join(failed.keys())
+            notices.append(
+                f"Правка не применена: симуляция хода завершила её со статусом Failed.\n"
+                f"Ревизии: {ids}.\nОна сохранена в истории версий; стоимость не списана."
+            )
         if era_after != era_before:
             next_span = calculate_turn_span(self.chronology, list(self.civilizations.values()))
             notices.append(
@@ -547,6 +576,7 @@ class TurnEngine:
             deferred_revisions=list(self._deferred_list),
             superseded_revisions=list(self._superseded_list),
             expired_effects=expired,
+            failed_revisions=dict(failed),
             economy=economy,
             folklore=folklore,
             prejudices=prejudices,
@@ -665,8 +695,17 @@ class TurnEngine:
                 )
         return count
 
-    def _apply_snapshot_changes(self, snap: TurnLawSnapshot, applied: list[str]) -> None:
+    def _apply_snapshot_changes(
+        self, snap: TurnLawSnapshot, applied: list[str],
+        failed: dict[str, str] | None = None,
+    ) -> None:
+        """Steps 7+12 of §13. A revision whose application raises is recorded
+        in ``failed`` (§3.4 Failed) and never lands in ``applied`` — the turn
+        continues with the remaining laws (partial failure is isolated)."""
+        if failed is None:
+            failed = {}
         for rev in snap.pending_amendments + snap.pending_repeals:
+          try:
             law = self.store.get_law(rev.law_id)
             match rev.action:
                 case LawUserAction.REPEAL_LAW:
@@ -706,7 +745,10 @@ class TurnEngine:
                         ))
                 case LawUserAction.CLARIFY_LAW:
                     law.raw_text = rev.raw_text
-            applied.append(rev.id)
+          except Exception as exc:      # §3.4 Failed — isolate this revision
+            failed[rev.id] = str(exc)
+            continue
+          applied.append(rev.id)
 
     def _on_effect_expired(self, eff: TimedEffect) -> None:
         if eff.kind == TimedEffectKind.LAW_TRANSITION:

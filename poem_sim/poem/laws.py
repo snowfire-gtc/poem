@@ -260,6 +260,15 @@ class LawStore:
         if reason:
             rev.canonical_change = replace(rev.canonical_change, note=reason)
 
+    def mark_failed(self, revision_id: LawRevisionId, reason: str = "") -> None:
+        """§3.4 ``Failed`` — the revision joined a simulation slice but its
+        application raised; it stays in history for audit and is never
+        retried silently (the player sees the verdict via §15.3/§16.2)."""
+        rev = self.get_revision(revision_id)
+        rev.status = LawRevisionStatus.FAILED
+        if reason:
+            rev.canonical_change = replace(rev.canonical_change, note=reason)
+
     def version_history(self, law_id: str) -> list[LawRevision]:
         """Full version history for UI (§16.2): includes superseded versions."""
         return self.revisions_for_law(law_id)

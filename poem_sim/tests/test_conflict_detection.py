@@ -68,7 +68,8 @@ def test_repeal_of_referenced_law_is_a_norm_conflict():
 
     cfg = PricingConfig()
     base = cost_of_law_change(store.get_law("law-tax"), LawUserAction.REPEAL_LAW,
-                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0)
+                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0,
+                              active_laws=snap.active_laws)
     assert rev.cost == pytest.approx(base + cfg.contradiction_penalty)
 
 
@@ -87,7 +88,7 @@ def test_repeal_without_dependents_has_no_contradiction_penalty():
     cfg = PricingConfig()
     assert rev.cost == pytest.approx(cost_of_law_change(
         store.get_law("law-tax"), LawUserAction.REPEAL_LAW, cfg=cfg,
-        scope_delta=len(rev.raw_text) / 500.0))
+        scope_delta=len(rev.raw_text) / 500.0, active_laws=snap.active_laws))
 
 
 def test_conflicts_are_evaluated_against_the_final_post_repeal_set():
@@ -117,7 +118,7 @@ def test_conflicts_are_evaluated_against_the_final_post_repeal_set():
     cfg = PricingConfig()
     assert amend.cost == pytest.approx(cost_of_law_change(
         store.get_law("law-census"), LawUserAction.AMEND_LAW, cfg=cfg,
-        scope_delta=len(amend.raw_text) / 500.0))
+        scope_delta=len(amend.raw_text) / 500.0, active_laws=snap.active_laws))
     # ...while the repeal itself still sees the dependent census law
     assert any(c.revision_id == repeal.id for c in snap.conflicts)
 
@@ -150,7 +151,8 @@ def test_opposed_kind_pair_conflict_priced_and_charged():
     clash = [c for c in snap.conflicts if c.law_a == "law-ban" and c.revision_id == rev.id]
     assert len(clash) == 1
     base = cost_of_law_change(store.get_law("law-ban"), LawUserAction.AMEND_LAW,
-                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0)
+                              cfg=cfg, scope_delta=len(rev.raw_text) / 500.0,
+                              active_laws=snap.active_laws)
     assert rev.cost == pytest.approx(base + cfg.contradiction_penalty)
 
 

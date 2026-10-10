@@ -63,6 +63,7 @@ def cost_of_law_change(
     administrative_overload: float = 0.0,
     transition_years: float = 0.0,
     urgent: bool = False,
+    active_laws: "list | tuple | None" = None,
 ) -> float:
     """Compute the gameplay cost of a confirmed law edit.
 
@@ -73,13 +74,19 @@ def cost_of_law_change(
     age_factor = 1.0 + min(law.age_years / 200.0, 1.0) * 0.5  # older laws: harder
     tradition_level = law.tradition * age_factor              # укоренённость × возраст
 
+    # Bureaucracy strain (§5: «уровень бюрократии») — the more active laws a
+    # civilization maintains, the heavier each additional edit lands on the
+    # administration. Derived purely from GAME state; no clock input exists
+    # here by design (§2, §20.5).
+    bureaucracy_level = max(len(active_laws or ()) - 1, 0)
+
     cost = (
         cfg.base_change_cost                                      # base_change_cost
         + cfg.complexity_unit_cost * law.complexity * weight      # complexity_delta
         + cfg.scope_unit_cost * scope_delta                       # scope_delta
         + tradition_level * cfg.tradition_penalty                 # tradition term
         + contradictions * cfg.contradiction_penalty              # contradiction_penalty
-        + (law.administrative_load + administrative_overload)
+        + (bureaucracy_level + law.administrative_load + administrative_overload)
         * cfg.admin_overload_unit_cost                            # admin overload
         + transition_years * cfg.transition_cost_per_year         # transitional period
     )

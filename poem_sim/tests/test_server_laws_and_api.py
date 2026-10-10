@@ -233,3 +233,119 @@ def test_snapshot_endpoint_exposes_turn_law_snapshot():
     assert run["status"] == 200
     snap2 = srv.handle("GET", "/api/v1/laws/snapshot")
     assert rev["id"] in snap2["civilizations"][0]["pending_amendments"]
+
+
+def test_submit_draft_via_revision_submit_endpoint():
+    """§15.2 + §3.2 SubmitDraft: POST .../revisions/{id}/submit with a
+    draft_id converts the validated server-side draft into an official
+    revision (Pending; cutoff decides its turn, time of day never does)."""
+    srv = server_with_law()
+    created = srv.handle("POST", "/api/v1/laws/drafts", {
+        "civilization_id": "c1", "raw_text": "Exempt small settlements.",
+        "target_law_id": "law-tax"})
+    draft_id = created["draft"]["id"]
+    # validate it (§3.3: only Validated/ReadyForPreview can be submitted)
+    upd = srv.handle("PUT", f"/api/v1/laws/drafts/{draft_id}",
+                     {"canonical_draft": {"kind": "tax"}})
+    assert upd["draft"]["status"] == "Validated"
+
+    sub = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/new/submit",
+                     {"draft_id": draft_id,
+                      "now": DAY.replace(hour=3).isoformat()})
+    assert sub["status"] == 200
+    rev = sub["revision"]
+    assert rev["action"] == "SubmitDraft"
+    assert rev["status"] == "Pending"
+    assert "Время подачи не влияет" in sub["notice"]   # §16.3, no penalty
+
+    # unvalidated drafts must not convert through the API either
+    d2 = srv.handle("POST", "/api/v1/laws/drafts",
+                    {"civilization_id": "c1", "raw_text": "wip",
+                     "target_law_id": "law-tax"})["draft"]["id"]
+    bad = srv.handle("POST", "/api/v1/laws/law-tax/revisions/new/submit",
+                     {"draft_id": d2})
+    assert bad["status"] == 400
+
+
+def test_draft_submission_applies_before_cutoff_same_cost_as_evening():
+    """§17.1 extended to the SubmitDraft path: identical draft submitted at
+    03:00 and 18:00 yields identical cost/status/application."""
+    outcomes = {}
+    for hour in (3, 18):
+        srv = server_with_law()
+        cutoff = DAY.replace(hour=20)
+        srv.handle("POST", "/api/v1/worlds/w1/turns/open", {
+            "started_at": DAY.isoformat(),
+            "simulation_cutoff_at": cutoff.isoformat()})
+        draft_id = srv.handle("POST", "/api/v1/laws/drafts", {
+            "civilization_id": "c1", "raw_text": "Lower rate for small hearths.",
+            "target_law_id": "law-tax"})["draft"]["id"]
+        srv.handle("PUT", f"/api/v1/laws/drafts/{draft_id}",
+                   {"canonical_draft": {"kind": "tax", "effect": {"rate": 1}}})
+        rev = srv.handle("POST", "/api/v1/laws/law-tax/revisions/new/submit", {
+            "draft_id": draft_id,
+            "now": DAY.replace(hour=hour).isoformat()})["revision"]
+        run = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {})
+        outcomes[hour] = (rev["cost"], rev["status"],
+                          rev["id"] in run["applied_revisions"])
+    assert outcomes[3] == outcomes[18]
+
+
+# ---------------------------------------------------------------------------
+# §3.4 Rejected + §15.2 submit endpoint: validation verdict via API
+# ---------------------------------------------------------------------------
+
+def test_reject_pending_revision_via_submit_endpoint():
+    """POST .../revisions/{id}/submit with reject_reason marks the revision
+    Rejected (§3.4): it never joins a slice but stays in version history."""
+    srv = server_with_law()
+    created = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+        "civilization_id": "c1", "action": "amend_law",
+        "raw_text": "Contradictory nonsense.",
+        "canonical_change": {"action": "amend_law"},
+        "now": DAY.replace(hour=9).isoformat()})
+    rev_id = created["revision"]["id"]
+
+    rej = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
+                     {"reject_reason": "canonical validation failed"})
+    assert rej["status"] == 200
+    assert rej["revision"]["status"] == "Rejected"
+    assert "отклонена" in rej["notice"].lower()
+
+    # §15.3: reported as rejected, not pending
+    pend = srv.handle("GET", "/api/v1/laws/pending")
+    ids_rejected = [r["id"] for r in pend["rejected"]]
+    ids_will_apply = [r["id"] for r in pend.get("will_apply_this_slice", [])]
+    assert rev_id in ids_rejected
+    assert rev_id not in ids_will_apply
+
+    # run a turn anyway: rejected revision must NOT be applied (§3.4)
+    run = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {
+        "started_at": DAY.isoformat(),
+        "simulation_cutoff_at": DAY.replace(hour=23).isoformat()})
+    assert run["status"] == 200
+    assert rev_id not in run["applied_revisions"]
+    # history preserved (§16.2)
+    hist = srv.handle("GET", "/api/v1/laws/law-tax/revisions")
+    assert any(r["id"] == rev_id and r["status"] == "Rejected"
+               for r in hist["revisions"])
+
+
+def test_reject_only_applies_to_pending_and_is_time_of_day_neutral():
+    """Double rejection -> 4xx; identical rejection at 03:00/18:00 behaves
+    identically (§17.1 extended to the validation-verdict path)."""
+    for hour in (3, 18):
+        srv = server_with_law()
+        created = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+            "civilization_id": "c1", "action": "clarify_law",
+            "raw_text": "Clarify wording.",
+            "canonical_change": {"action": "clarify_law"},
+            "now": DAY.replace(hour=hour).isoformat()})
+        rev_id = created["revision"]["id"]
+        rej = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
+                         {"reject_reason": "ambiguous scope"})
+        assert rej["status"] == 200
+        assert rej["revision"]["status"] == "Rejected"
+        again = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
+                           {"reject_reason": "again"})
+        assert again["status"] == 400   # only Pending revisions can be rejected
