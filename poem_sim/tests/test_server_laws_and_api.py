@@ -289,3 +289,63 @@ def test_draft_submission_applies_before_cutoff_same_cost_as_evening():
         outcomes[hour] = (rev["cost"], rev["status"],
                           rev["id"] in run["applied_revisions"])
     assert outcomes[3] == outcomes[18]
+
+
+# ---------------------------------------------------------------------------
+# §3.4 Rejected + §15.2 submit endpoint: validation verdict via API
+# ---------------------------------------------------------------------------
+
+def test_reject_pending_revision_via_submit_endpoint():
+    """POST .../revisions/{id}/submit with reject_reason marks the revision
+    Rejected (§3.4): it never joins a slice but stays in version history."""
+    srv = server_with_law()
+    created = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+        "civilization_id": "c1", "action": "amend_law",
+        "raw_text": "Contradictory nonsense.",
+        "canonical_change": {"action": "amend_law"},
+        "now": DAY.replace(hour=9).isoformat()})
+    rev_id = created["revision"]["id"]
+
+    rej = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
+                     {"reject_reason": "canonical validation failed"})
+    assert rej["status"] == 200
+    assert rej["revision"]["status"] == "Rejected"
+    assert "отклонена" in rej["notice"].lower()
+
+    # §15.3: reported as rejected, not pending
+    pend = srv.handle("GET", "/api/v1/laws/pending")
+    ids_rejected = [r["id"] for r in pend["rejected"]]
+    ids_will_apply = [r["id"] for r in pend.get("will_apply_this_slice", [])]
+    assert rev_id in ids_rejected
+    assert rev_id not in ids_will_apply
+
+    # run a turn anyway: rejected revision must NOT be applied (§3.4)
+    run = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {
+        "started_at": DAY.isoformat(),
+        "simulation_cutoff_at": DAY.replace(hour=23).isoformat()})
+    assert run["status"] == 200
+    assert rev_id not in run["applied_revisions"]
+    # history preserved (§16.2)
+    hist = srv.handle("GET", "/api/v1/laws/law-tax/revisions")
+    assert any(r["id"] == rev_id and r["status"] == "Rejected"
+               for r in hist["revisions"])
+
+
+def test_reject_only_applies_to_pending_and_is_time_of_day_neutral():
+    """Double rejection -> 4xx; identical rejection at 03:00/18:00 behaves
+    identically (§17.1 extended to the validation-verdict path)."""
+    for hour in (3, 18):
+        srv = server_with_law()
+        created = srv.handle("POST", "/api/v1/laws/law-tax/revisions", {
+            "civilization_id": "c1", "action": "clarify_law",
+            "raw_text": "Clarify wording.",
+            "canonical_change": {"action": "clarify_law"},
+            "now": DAY.replace(hour=hour).isoformat()})
+        rev_id = created["revision"]["id"]
+        rej = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
+                         {"reject_reason": "ambiguous scope"})
+        assert rej["status"] == 200
+        assert rej["revision"]["status"] == "Rejected"
+        again = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
+                           {"reject_reason": "again"})
+        assert again["status"] == 400   # only Pending revisions can be rejected

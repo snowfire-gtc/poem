@@ -159,12 +159,16 @@ class WorldServer:
     def submit_revision(self, path: str, body: dict) -> dict:
         """POST /api/v1/laws/{id}/revisions/{revision_id}/submit (§15.2).
 
-        Two roles, mirroring §3.2/§3.3 (``LawUserAction.SubmitDraft``):
+        Three roles, mirroring §3.2/§3.3 (``LawUserAction.SubmitDraft``):
 
         * ``{"draft_id": ...}`` in the body — convert a server-side draft
           into an official revision (validated drafts only, §3.3); the
           created revision is Pending and its turn is decided by the
           logical cutoff alone (§4.1), never by time of day (§2).
+        * ``{"reject_reason": ...}`` — validation verdict Rejected (§3.4):
+          the revision is removed from future slices, kept in history for
+          audit (§16.2 version list) and reported via GET /laws/pending
+          (§15.3 «какие отклонены»).
         * otherwise — confirm an already-recorded revision: it stays
           Pending; the cutoff decides whether it joins this or the next
           slice (§4.4). No penalty either way.
@@ -172,10 +176,28 @@ class WorldServer:
         law_id = _path_id(path, "laws")
         revision_id = _path_id(path, "revisions")
         draft_id = body.get("draft_id")
+        reject_reason = body.get("reject_reason")
         if draft_id is not None:
             rev = self.store.submit_draft(draft_id, now=_parse_dt(body.get("now")))
             if rev.law_id != law_id:
                 raise ValueError("draft targets another law")
+        elif reject_reason is not None:
+            rev = self.store.get_revision(revision_id)
+            if rev.law_id != law_id:
+                raise ValueError("revision does not belong to law")
+            if rev.status.value != "Pending":
+                raise ValueError(
+                    f"only Pending revisions can be rejected "
+                    f"(current status: {rev.status.value})")
+            self.store.mark_rejected(revision_id, reason=str(reject_reason))
+            return {
+                "revision": _revision_json(self.store.get_revision(revision_id)),
+                "notice": (
+                    "Правка отклонена при валидации.\n"
+                    "Она сохранена в истории версий для аудита и не будет "
+                    "учтена ни в одном ходе."
+                ),
+            }
         else:
             rev = self.store.get_revision(revision_id)
             if rev.law_id != law_id:
