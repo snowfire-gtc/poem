@@ -238,7 +238,8 @@ class WorldServer:
 
         turn = self.engine.current_turn
         cutoff = turn.simulation_cutoff_at if turn else None
-        will_apply, in_snapshot, deferred, superseded, rejected = [], [], [], [], []
+        will_apply, in_snapshot, deferred, superseded, rejected, failed = \
+            [], [], [], [], [], []
         for rev in self.store._revisions.values():
             payload = _revision_json(rev)
             if rev.status == LRS.PENDING:
@@ -252,6 +253,10 @@ class WorldServer:
                 superseded.append(payload)        # перезаписана более поздней
             elif rev.status == LRS.REJECTED:
                 rejected.append(payload)
+            elif rev.status == LRS.FAILED:
+                # §3.4 Failed — applied-attempt raised during simulation;
+                # kept visible so the player learns the verdict (§15.3).
+                failed.append(payload)
             # APPLIED revisions are already part of the law's official
             # version history (GET /api/v1/laws/{id}); they are neither
             # pending nor "in this turn's snapshot" anymore (§3.4 statuses).
@@ -261,6 +266,7 @@ class WorldServer:
             "awaiting_next_turn": deferred,
             "superseded": superseded,
             "rejected": rejected,
+            "failed": failed,
             "cutoff": cutoff.isoformat() if cutoff else None,
             "note": "Время подачи правки не влияет на эффективность (TASK-060).",
         }
