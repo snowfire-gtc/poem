@@ -300,3 +300,39 @@ def test_folklore_conflict_with_customary_remnant_amplifies_mutation():
     m_plain = plain.folklore["f1"]["mutation_gain"]
     m_repealed = repealed.folklore["f1"]["mutation_gain"]
     assert m_repealed > m_plain  # conflict with folk memory amplifies drift
+
+
+# ---------------------------------------------------------------------------
+# §11.8 — путешествия и послы измеряются игровым временем
+# ---------------------------------------------------------------------------
+
+def travel(duration_years: float) -> TimedEffect:
+    return TimedEffect(
+        id="tr1", world_id="w1", civilization_id="c1",
+        kind=TimedEffectKind.TRAVEL,
+        remaining=SimDuration(years=duration_years),
+        payload={"envoy": True},
+    )
+
+
+def test_envoy_travel_expires_by_game_time_not_turn_count():
+    """A 5-year embassy arrives in 1 turn of the ancient era (40 y/turn)
+    but takes 3 turns in the modern era (2 y/turn) — same game time (§11.8)."""
+    chrono = classical_world()
+
+    ancient_civ = Civilization(id="a", progress=0.10)   # ancient: 40 y/turn
+    assert calculate_turn_span(chrono, [ancient_civ]).years == 40.0
+    t_ancient = travel(5.0)
+    assert t_ancient.tick(calculate_turn_span(chrono, [ancient_civ]))  # 1 turn
+
+    modern_civ = Civilization(id="a", progress=0.75)    # modern: 2 y/turn
+    assert calculate_turn_span(chrono, [modern_civ]).years == 2.0
+    t_modern = travel(5.0)
+    arrivals = 0
+    while not t_modern.remaining.is_expired and arrivals < 100:
+        arrived = t_modern.tick(calculate_turn_span(chrono, [modern_civ]))
+        arrivals += 1
+        if arrived:
+            break
+    assert arrivals == 3                    # 2+2+2 >= 5 — same game time (5 лет)
+    assert t_modern.remaining.years <= 0

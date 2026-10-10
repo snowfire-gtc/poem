@@ -286,6 +286,9 @@ class TurnEngine:
                     law.tradition += tradition_gain(0.002, span)
 
         # Step 16/§11.6–11.8: tick all timed effects in GAME time.
+        # Treaties, law transitions and travel (§11.6, §11.7, §11.8) all
+        # consume the turn span from their `remaining` budget; they expire by
+        # game time, never by a fixed number of turns.
         # Only effects that existed BEFORE this turn's law application are
         # ticked and expired; a suspension/transition created during this
         # very turn must not complete (and auto-reinstate) within the same
