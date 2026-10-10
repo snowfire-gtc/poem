@@ -141,6 +141,7 @@ class CanonicalLaw:
     kind: str                      # e.g. "tax", "corvee", "ban"
     scope: dict = field(default_factory=dict)   # {"population_below": 200} etc.
     effect: dict = field(default_factory=dict)  # parameterised effects
+    refs: tuple = ()               # ids of other laws this norm depends on
     text_summary: str = ""
 
 
@@ -237,6 +238,7 @@ class LawConflict:
     law_a: LawId
     law_b: LawId | None = None      # None => conflict with folklore/custom
     folklore_ref: str | None = None
+    revision_id: str | None = None  # the pending edit that creates this clash
     severity: float = 0.5
     description: str = ""
 
@@ -307,6 +309,42 @@ class TimedEffectKind(enum.Enum):
     LAW_TRANSITION = "law_transition"
     TRAVEL = "travel"
     SUSPENSION = "suspension"
+    WAR = "war"
+
+
+@dataclass
+class War:
+    """An ongoing conflict between civilizations (§13 step 17).
+
+    Wars live in GAME time like every other long effect (§20.9): fatigue
+    accumulates proportionally to the turn span, so a 40-year ancient turn
+    exhausts a society far more than a 1-year modern turn. Nothing here
+    depends on real-world time of day (§20.4).
+    """
+
+    id: str
+    world_id: WorldId
+    attacker_id: CivilizationId
+    defender_id: CivilizationId
+    started_year: float = 0.0
+    active: bool = True
+    fatigue_attacker: float = 0.0     # accumulated social exhaustion 0..1+
+    fatigue_defender: float = 0.0
+    annual_fatigue_rate: float = 0.01  # per game-year while active
+
+    def tick(self, span_years: float) -> None:
+        """Advance one turn interval; heavy processes are NOT linear (§19.1):
+        fatigue gains diminish as exhaustion grows."""
+        if not self.active:
+            return
+        self.fatigue_attacker += self.annual_fatigue_rate * span_years / (
+            1.0 + self.fatigue_attacker)
+        self.fatigue_defender += self.annual_fatigue_rate * span_years / (
+            1.0 + self.fatigue_defender)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.fatigue_attacker >= 1.0 and self.fatigue_defender >= 1.0
 
 
 @dataclass
@@ -351,6 +389,40 @@ class TimedEffect:
 @dataclass
 class Treaty(TimedEffect):
     treaty_kind: str = "peace"
+
+
+# ---------------------------------------------------------------------------
+# Interval events — chronicle of what happened during one turn span (§19.1)
+# ---------------------------------------------------------------------------
+
+# A turn shorter than this produces no intermediate cultural milestones:
+# small yearly processes are not faked frame-by-frame (§19.1).
+MIN_EVENT_SPAN_YEARS = 5.0
+# Approximate spacing of generated culture/folklore milestones inside a long
+# interval, so 40-year ancient turns read as a chronicle, not a time jump.
+EVENT_INTERVAL_YEARS = 25.0
+
+
+@dataclass
+class IntervalEvent:
+    """A chronicle entry covering the whole turn interval (§19.1).
+
+    Key events (era change, treaty expiry, law repeal/suspension, envoy
+    arrival) always appear; additionally, evenly spaced cultural-folklore
+    milestones are generated inside long intervals so that players do not
+    feel entire decades were skipped. Generation is deterministic in game
+    time — wall-clock time of day never influences it (§20.4).
+    """
+
+    kind: str            # EraChange | Suspension | Repeal | TreatyExpired |
+                         # TravelArrival | TransitionEnd | CulturalMilestone
+    year: float          # world year at which the event is placed
+    title: str
+    detail: str = ""
+
+    def to_json(self) -> dict:
+        return {"kind": self.kind, "year": round(self.year, 2),
+                "title": self.title, "detail": self.detail}
 
 
 # ---------------------------------------------------------------------------

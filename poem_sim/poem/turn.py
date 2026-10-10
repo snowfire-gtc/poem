@@ -46,6 +46,8 @@ from .core import (
     SimDuration,
     TimedEffect,
     TimedEffectKind,
+    Treaty,
+    War,
     Turn,
     TurnLawSnapshot,
     TurnStatus,
@@ -87,8 +89,12 @@ class TurnReport:
     economy: dict[str, dict[str, float]] = field(default_factory=dict)
     folklore: dict[str, dict[str, float]] = field(default_factory=dict)
     prejudices: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 15
+    diplomacy: list[dict] = field(default_factory=list)           # §13 step 16
+    wars: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 17
     admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
     notices: list[str] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)              # §19.1 chronicle
+    expired_effect_details: list[dict] = field(default_factory=list)  # for events
     view: dict = field(default_factory=dict)                      # §13 step 19
     image_tasks: list[dict] = field(default_factory=list)         # §13 step 20
 
@@ -115,6 +121,9 @@ class TurnEngine:
         self.folklore: list[FolkloreItem] = []
         # Prejudices (§13 step 15): long-lived social biases scaled by game time.
         self.prejudices: list[Prejudice] = []
+        # Wars (§13 step 17): conflicts measured in GAME time; fatigue scales
+        # with the turn span, never with wall-clock time of day (§20.4).
+        self.wars: list[War] = []
         # per-turn prejudice deltas (§13 step 15), keyed by prejudice id
         self._prejudice_delta: dict[str, float] = {}
         self.turns: list[Turn] = []
@@ -126,6 +135,9 @@ class TurnEngine:
         self._snapshot_list: list[TurnLawSnapshot] = []
         self._deferred_list: list[str] = []
         self._superseded_list: list[str] = []
+        # §15.3: last prepared snapshot, readable by the API even after the
+        # turn has been finalized (until the next prepare_snapshot overwrites).
+        self.last_snapshots: list[TurnLawSnapshot] = []
 
     # ------------------------------------------------------------------ turns
 
@@ -224,6 +236,11 @@ class TurnEngine:
                 winner_action = winner.action if winner is not None else None
                 if winner_action == LawUserAction.REPEAL_LAW:
                     pass  # recorded in snap.pending_repeals; not active anymore
+                elif winner_action == LawUserAction.SUSPEND_LAW:
+                    # §4.2/§4.3: the winning suspension means the law is NOT
+                    # part of this turn's active set (it joins suspended_laws
+                    # in pass 2, together with its priced revision).
+                    pass
                 elif law.status == LawStatus.ACTIVE:
                     snap.active_laws.append(law)
                 elif law.status == LawStatus.SUSPENDED:
@@ -234,24 +251,45 @@ class TurnEngine:
                                      title=law.title, strength=min(law.tradition, 1.0))
                     )
 
-            # Pass 2: price and attach each law's winning revision.
+            # Pass 2: attach each law's winning revision to the snapshot.
+            # Repeals are classified first (their laws leave the active set),
+            # then amendments are priced against the POST-repeal legal system
+            # (§13 step 13 must see the final norm configuration, §4.3).
+            deferred_repeal_pricing: list[tuple] = []
             for law in laws:
                 winner = winners.get(law.id)
                 if winner is None:
                     continue
-                # §13 step 13 (norm-conflict detection) feeds the §5.1
-                # contradiction_penalty term of the price shown to the
-                # player *before* submission (§16: "показывать стоимость").
-                # The prospective canonical form of the amendment is what
-                # conflicts with the rest of the legal system — if the
-                # revision carries a new canonical, it replaces the old one
-                # for conflict purposes.
+                self.store.mark_included(winner.id, turn.id)
+                if winner.action == LawUserAction.REPEAL_LAW:
+                    snap.pending_repeals.append(winner)
+                    deferred_repeal_pricing.append((law, winner))
+                    continue
+                if winner.action == LawUserAction.SUSPEND_LAW:
+                    if law.id not in snap.suspended_laws:
+                        snap.suspended_laws.append(law.id)
+                snap.pending_amendments.append(winner)
+
+            # Pass 3: price every included revision now that the snapshot's
+            # final active set is known.
+            # §13 step 13 (norm-conflict detection) feeds the §5.1
+            # contradiction_penalty term of the price shown to the player
+            # *before* submission (§16: "показывать стоимость"). The
+            # prospective canonical form of the amendment is what conflicts
+            # with the rest of the legal system — if the revision carries a
+            # new canonical, it replaces the old one for conflict purposes.
+            repealed_ids = {rev.law_id for _, rev in deferred_repeal_pricing}
+            for law in laws:
+                winner = winners.get(law.id)
+                if winner is None:
+                    continue
                 effective_canonical = (
                     winner.canonical_change.new_canonical
                     or law.canonical
                 )
                 contradictions = self._count_conflicts(
-                    law, snap, civ_id, prospective=effective_canonical)
+                    law, snap, civ_id, prospective=effective_canonical,
+                    revision_id=winner.id, exclude_active=repealed_ids)
                 winner.cost = cost_of_law_change(
                     law, winner.action, cfg=self.pricing_cfg,
                     scope_delta=len(winner.raw_text) / 500.0,
@@ -261,19 +299,13 @@ class TurnEngine:
                         if winner.canonical_change.transition else 0.0),
                     urgent=winner.canonical_change.urgent,
                 )
-                self.store.mark_included(winner.id, turn.id)
-                if winner.action in (LawUserAction.REPEAL_LAW,):
-                    snap.pending_repeals.append(winner)
-                elif winner.action == LawUserAction.SUSPEND_LAW:
-                    if law.id not in snap.suspended_laws:
-                        snap.suspended_laws.append(law.id)
-                    snap.pending_amendments.append(winner)
-                else:
-                    snap.pending_amendments.append(winner)
             snapshots.append(snap)
 
         turn.status = TurnStatus.SNAPSHOT_PREPARED
         self._snapshot_list = snapshots
+        # §15.3: the snapshot itself is a server-side artefact players can
+        # inspect (active set, pending edits, suspensions, conflicts).
+        self.last_snapshots = snapshots
         return snapshots
 
     # ------------------------------------------------------------ simulation
@@ -334,14 +366,72 @@ class TurnEngine:
         # turn (§11.7 — transitions finish on later turns' ticks).
         pre_turn_effects = self._pre_turn_effect_ids
         expired: list[str] = []
+        expired_details: list[dict] = []
         survivors: list[TimedEffect] = []
         for eff in self.timed_effects:
             if eff.id in pre_turn_effects and eff.tick(span):
                 expired.append(eff.id)
+                # §19.1: keep enough detail to render the expiry as a
+                # chronicle entry (kind + human-readable subject).
+                expired_details.append({
+                    "effect_id": eff.id,
+                    "kind": eff.kind.value,
+                    "detail": str(eff.payload.get("law_id")
+                                  or eff.payload.get("treaty_kind")
+                                  or eff.payload.get("destination", "")),
+                })
                 self._on_effect_expired(eff)
             else:
                 survivors.append(eff)
         self.timed_effects = survivors
+
+        # Step 16 (§13): diplomacy — report the surviving treaties' remaining
+        # duration in GAME time (§11.6). Durations are stored in years, never
+        # in turn counts; a 100-year treaty ticks down by the turn span each
+        # turn and expires by game time (3 turns at 40 y/turn, 100 at 1 y/turn).
+        diplomacy: list[dict] = []
+        for eff in self.timed_effects:
+            if isinstance(eff, Treaty) or eff.kind == TimedEffectKind.TREATY:
+                diplomacy.append({
+                    "treaty_id": eff.id,
+                    "kind": eff.payload.get("treaty_kind", "peace"),
+                    "civilization_id": eff.civilization_id,
+                    "remaining_years": max(eff.remaining.years, 0.0),
+                })
+            elif eff.kind == TimedEffectKind.TRAVEL:
+                diplomacy.append({
+                    "travel_id": eff.id,
+                    "kind": "envoy_travel",
+                    "civilization_id": eff.civilization_id,
+                    "remaining_years": max(eff.remaining.years, 0.0),
+                })
+
+        # Step 17 (§13): wars — fatigue accumulates proportionally to the
+        # turn's GAME-time span with diminishing gains (§19.1: not every
+        # process scales linearly). An exhausted side sues for peace: the war
+        # ends and a peace treaty is concluded for 25 game-years — its clock
+        # then runs in game time like every other duration (§11.6).
+        wars: dict[str, dict[str, float]] = {}
+        for war in self.wars:
+            if not war.active:
+                continue
+            war.tick(span.years)
+            if war.exhausted:
+                war.active = False
+                self.timed_effects.append(Treaty(
+                    id=str(uuid.uuid4()), world_id=self.world_id,
+                    civilization_id=war.attacker_id,
+                    kind=TimedEffectKind.TREATY,
+                    remaining=SimDuration(years=25.0),
+                    payload={"treaty_kind": "peace",
+                             "ended_war_id": war.id,
+                             "other_party": war.defender_id},
+                ))
+            wars[war.id] = {
+                "active": 1.0 if war.active else 0.0,
+                "fatigue_attacker": round(war.fatigue_attacker, 4),
+                "fatigue_defender": round(war.fatigue_defender, 4),
+            }
 
         # Step 14 (§11.5): update folklore — spread & mutation scale with the
         # turn's GAME-time span, never with real-world time of day (§20.4).
@@ -460,14 +550,24 @@ class TurnEngine:
             economy=economy,
             folklore=folklore,
             prejudices=prejudices,
+            diplomacy=diplomacy,
+            wars=wars,
             admin_costs=admin_costs,
             notices=notices,
+            expired_effect_details=expired_details,
         )
+
+        # §19.1: build the turn chronicle ("events for the interval") BEFORE
+        # the view, so clients receive intermediate cultural milestones and
+        # key events instead of a bare time jump.
+        from .views import (
+            build_turn_view, interval_events, queue_image_tasks)
+
+        report.events = [e.to_json() for e in
+                         interval_events(report, turn.world_year_before)]
 
         # Steps 19–20 (§13): generate client representations from the finalized
         # report, then queue chronicle illustration tasks derived from them.
-        from .views import build_turn_view, queue_image_tasks
-
         report.view = build_turn_view(
             report, self.chronology, list(self.civilizations.values()))
         report.image_tasks = [t.to_json() for t in queue_image_tasks(report.view, self.world_id)]
@@ -477,7 +577,8 @@ class TurnEngine:
     # ------------------------------------------------------------- internals
 
     def _count_conflicts(
-        self, law, snap: TurnLawSnapshot, civ_id: str, prospective=None
+        self, law, snap: TurnLawSnapshot, civ_id: str, prospective=None,
+        revision_id: str | None = None, exclude_active: set[str] | None = None,
     ) -> int:
         """§13 step 13 (norm-conflict detection), used for §5 pricing.
 
@@ -486,18 +587,59 @@ class TurnEngine:
         pays ``contradiction_penalty`` per conflict (§5.1). Deterministic and
         independent of wall-clock time. Detected conflicts are also recorded
         on the snapshot (§4.3 ``conflicts``) so clients can display them
-        (§16.2).
+        (§16.2). Each entry names the pending edit that creates the clash
+        (``revision_id``) so the UI can point at the exact amendment.
 
-        Two kinds of contradiction are recognised:
+        Three kinds of contradiction are recognised:
          * identical canonical kind — two laws regulating the same matter;
-         * conflicting kind pair (``kinds_conflict``, e.g. tax vs ban).
+         * conflicting kind pair (``kinds_conflict``, e.g. tax vs ban);
+         * an incoming REPEAL that removes a law another ACTIVE law still
+           depends on — repealing the enforcement norm while the obligation
+           norm survives is itself a legal-system contradiction (§5.1
+           «конфликт с другими законами»).
+
+        ``exclude_active`` lists laws that will be repealed within this very
+        snapshot: they must not count as conflict partners any more, because
+        step 13 evaluates against the FINAL norm configuration (§4.3).
         """
         from .core import kinds_conflict
 
         canon = prospective if prospective is not None else law.canonical
+        excluded = exclude_active or set()
         count = 0
+
+        # Repeal-dependency conflict: does any remaining active law reference
+        # this law (canonical refs or title mention)? Repealing it while the
+        # referencing law stays active produces a contradiction.
+        if revision_id is not None:
+            rev = None
+            from .laws import LawStoreError
+            try:
+                rev = self.store.get_revision(revision_id)
+            except (KeyError, LawStoreError):
+                rev = None
+            if rev is not None and rev.action == LawUserAction.REPEAL_LAW:
+                for other in snap.active_laws:
+                    if other.id == law.id or other.id in excluded:
+                        continue
+                    depends = (
+                        law.id in getattr(other.canonical, "refs", ())
+                        if other.canonical is not None else False
+                    ) or (bool(law.title) and law.title in other.raw_text)
+                    if depends:
+                        count += 1
+                        snap.conflicts.append(
+                            LawConflict(law_a=law.id, law_b=other.id,
+                                        revision_id=revision_id,
+                                        severity=0.75,
+                                        description=(
+                                            f"repealing {law.title!r} leaves "
+                                            f"{other.title!r} without its "
+                                            "referenced norm"))
+                        )
+
         for other in snap.active_laws:
-            if other.id == law.id:
+            if other.id == law.id or other.id in excluded:
                 continue
             if canon is not None and other.canonical is not None:
                 same_kind = other.canonical.kind == canon.kind
@@ -506,6 +648,7 @@ class TurnEngine:
                     count += 1
                     snap.conflicts.append(
                         LawConflict(law_a=law.id, law_b=other.id,
+                                    revision_id=revision_id,
                                     description=(
                                         "two active laws of the same kind"
                                         if same_kind else
@@ -517,6 +660,7 @@ class TurnEngine:
                 count += 1
                 snap.conflicts.append(
                     LawConflict(law_a=law.id, law_b=None, folklore_ref=rem.title,
+                                revision_id=revision_id,
                                 description="law contradicts a customary remnant")
                 )
         return count
@@ -532,13 +676,18 @@ class TurnEngine:
                     years = rev.canonical_change.suspend_years or max(
                         self.chronology.seasons_per_year and 1.0, 1.0
                     )
-                    self.timed_effects.append(TimedEffect(
+                    # §4.2 example: "приостановить закон на один сезон" — the
+                    # suspension clock runs in GAME time (§11.7/§20.9): the
+                    # requested duration is interpreted directly in years.
+                    eff = TimedEffect(
                         id=str(uuid.uuid4()), world_id=self.world_id,
                         civilization_id=law.civilization_id,
                         kind=TimedEffectKind.SUSPENSION,
                         remaining=SimDuration(years=years),
                         payload={"law_id": law.id},
-                    ))
+                    )
+                    self.timed_effects.append(eff)
+                    snap.suspended_laws.append(law.id)   # §4.3 snapshot field
                 case LawUserAction.REINSTATE_LAW:
                     law.status = LawStatus.ACTIVE
                 case LawUserAction.AMEND_LAW | LawUserAction.SUBMIT_DRAFT:

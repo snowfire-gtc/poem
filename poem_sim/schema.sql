@@ -99,3 +99,33 @@ CREATE TABLE IF NOT EXISTS prejudices (
     annual_decay DOUBLE PRECISION NOT NULL DEFAULT 0.002,
     resolved BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- Wars (§13 step 17): conflicts measured in GAME time. Fatigue accumulates
+-- per game-year (with diminishing gains, §19.1) and is NOT a function of
+-- real-world time of day (§20.4). A war that exhausts both sides ends and
+-- produces a peace treaty stored in timed_effects with remaining_years.
+CREATE TABLE IF NOT EXISTS wars (
+    id UUID PRIMARY KEY,
+    world_id UUID NOT NULL,
+    attacker_id UUID NOT NULL,
+    defender_id UUID NOT NULL,
+    started_year DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    fatigue_attacker DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    fatigue_defender DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    annual_fatigue_rate DOUBLE PRECISION NOT NULL DEFAULT 0.01
+);
+
+-- Interval events (§19.1): the chronicle of one turn span. Key events and
+-- intermediate cultural milestones are stored per turn so long intervals
+-- read as a story instead of a time jump. `year` is WORLD (game) time;
+-- generation never depends on real-world time of day (§20.4).
+CREATE TABLE IF NOT EXISTS interval_events (
+    id UUID PRIMARY KEY,
+    world_id UUID NOT NULL,
+    turn_id UUID NOT NULL,
+    kind TEXT NOT NULL,
+    year DOUBLE PRECISION NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);

@@ -19,10 +19,13 @@ from .core import (
     EraSource,
     GameSpeed,
     Law,
+    LawRevisionStatus,
+    LawStatus,
     LawUserAction,
     SimDuration,
     TimedEffect,
     TimedEffectKind,
+    War,
 )
 from .laws import LawStore
 from .pricing import cost_of_law_change
@@ -53,6 +56,11 @@ class WorldServer:
         self.engine = TurnEngine(
             world_id, self.store, self.chronology, [], timed_effects=self.timed_effects
         )
+        # The engine rebinds its effects list when a turn finalises (it
+        # replaces the list with survivors), so the server must always read
+        # the *live* engine list — otherwise newly created transitions /
+        # suspensions would be invisible to API queries.
+        self._effects_view = lambda: self.engine.timed_effects
 
     def add_civilization(self, civ: Civilization) -> None:
         self.civilizations[civ.id] = civ
@@ -115,13 +123,14 @@ class WorldServer:
 
     def create_revision(self, path: str, body: dict) -> dict:
         law_id = _path_id(path, "laws")
+        action = _parse_action(body["action"])
         rev = self.store.record_revision(
             law_id=law_id,
             civilization_id=body["civilization_id"],
-            action=LawUserAction(body["action"]),
+            action=action,
             raw_text=body["raw_text"],
             canonical_change=CanonicalLawChange(
-                action=LawUserAction(body["action"]),
+                action=action,
                 new_canonical=(
                     CanonicalLaw(**body["canonical_change"]["new_canonical"])
                     if body.get("canonical_change", {}).get("new_canonical") else None
@@ -164,32 +173,74 @@ class WorldServer:
     # ================= pending (§15.3) =====================================
 
     def get_pending(self, path: str, body: dict) -> dict:
-        """Shows which edits join which slice, superseded/rejected/deferred lists."""
+        """§15.3 — five buckets required by the design doc:
+
+         * what will be counted in the NEXT slice (pending, before cutoff);
+         * what has ALREADY joined the current snapshot (IncludedInSimulation);
+         * what was SUPERSEDED by a later confirmed version;
+         * what was REJECTED;
+         * what AWAITS the next turn (received after the cutoff — preserved,
+           never discarded, no time-of-day penalty, §4.4).
+        """
         from .core import LawRevisionStatus as LRS
 
         turn = self.engine.current_turn
         cutoff = turn.simulation_cutoff_at if turn else None
-        included, deferred, superseded, rejected = [], [], [], []
+        will_apply, in_snapshot, deferred, superseded, rejected = [], [], [], [], []
         for rev in self.store._revisions.values():
             payload = _revision_json(rev)
             if rev.status == LRS.PENDING:
                 if cutoff is not None and rev.received_at > cutoff:
                     deferred.append(payload)      # будет учтена в следующем ходу
                 else:
-                    included.append(payload)      # войдёт в текущий снимок
+                    will_apply.append(payload)    # войдёт в текущий снимок
+            elif rev.status == LRS.INCLUDED_IN_SIMULATION:
+                in_snapshot.append(payload)       # уже вошла в снимок этого хода
             elif rev.status == LRS.SUPERSEDED:
                 superseded.append(payload)        # перезаписана более поздней
             elif rev.status == LRS.REJECTED:
                 rejected.append(payload)
-            else:
-                included.append(payload)          # IncludedInSimulation / Applied
+            # APPLIED revisions are already part of the law's official
+            # version history (GET /api/v1/laws/{id}); they are neither
+            # pending nor "in this turn's snapshot" anymore (§3.4 statuses).
         return {
-            "will_apply_this_slice": included,
+            "will_apply_this_slice": will_apply,
+            "included_in_current_snapshot": in_snapshot,
             "awaiting_next_turn": deferred,
             "superseded": superseded,
             "rejected": rejected,
             "cutoff": cutoff.isoformat() if cutoff else None,
             "note": "Время подачи правки не влияет на эффективность (TASK-060).",
+        }
+
+    def get_snapshot(self, path: str, body: dict) -> dict:
+        """§4.3 / §15.3 — the exact TurnLawSnapshot the simulation reads.
+
+        Readable at any time; reflects the last prepared snapshot (statuses
+        IncludedInSimulation correspond to what has already joined it)."""
+        snaps = self.engine.last_snapshots
+        return {
+            "turn_id": snaps[0].turn_id if snaps else None,
+            "civilizations": [
+                {
+                    "civilization_id": s.civilization_id,
+                    "active_laws": [l.id for l in s.active_laws],
+                    "pending_amendments": [r.id for r in s.pending_amendments],
+                    "pending_repeals": [r.id for r in s.pending_repeals],
+                    "suspended_laws": list(s.suspended_laws),
+                    "customary_remnants": [c.id for c in s.customary_remnants],
+                    "conflicts": [
+                        {"law_a": c.law_a, "law_b": c.law_b,
+                         "folklore_ref": c.folklore_ref,
+                         "revision_id": c.revision_id,
+                         "severity": c.severity,
+                         "description": c.description}
+                        for c in s.conflicts
+                    ],
+                }
+                for s in snaps
+            ],
+            "note": "Симуляция читает именно этот снимок (§4.3).",
         }
 
     # ================= cost preview (§16: "показывать стоимость") ==========
@@ -205,7 +256,7 @@ class WorldServer:
         """
         law_id = _path_id(path, "laws")
         law = self.store.get_law(law_id)
-        action = LawUserAction(body["action"])
+        action = _parse_action(body["action"])
         new_canonical = None
         if body.get("new_canonical") is not None:
             new_canonical = CanonicalLaw(**body["new_canonical"])
@@ -214,7 +265,7 @@ class WorldServer:
         scope_delta = len(body.get("raw_text", "")) / 500.0
 
         contradictions = self._count_preview_conflicts(
-            law, new_canonical or law.canonical)
+            law, new_canonical or law.canonical, action=action)
         cost = cost_of_law_change(
             law, action, cfg=self.engine.pricing_cfg,
             scope_delta=scope_delta,
@@ -230,21 +281,36 @@ class WorldServer:
 
         }
 
-    def _count_preview_conflicts(self, law, canon) -> int:
-        """Conflict count against the current active set (no turn running)."""
-        from .core import kinds_conflict
+    def _count_preview_conflicts(self, law, canon, action=None) -> int:
+        """Conflict count against the current active set (no turn running).
 
-        if canon is None:
-            return 0
+        Mirrors the engine's step-13 rules (§5.1 «конфликт с другими
+        законами»): same-kind overlap, contradictory kind pairs, and — for a
+        prospective REPEAL — dependency references from surviving laws.
+        """
+        from .core import LawUserAction as _A, kinds_conflict
+
         count = 0
         for other in self.store.laws_of(law.civilization_id):
             if other.id == law.id or other.canonical is None:
                 continue
             if other.status.value not in ("active", "in_transition"):
                 continue
-            if other.canonical.kind == canon.kind or \
-                    kinds_conflict(canon.kind, other.canonical.kind):
+            if canon is not None and (
+                    other.canonical.kind == canon.kind
+                    or kinds_conflict(canon.kind, other.canonical.kind)):
                 count += 1
+        if action == _A.REPEAL_LAW:
+            for other in self.store.laws_of(law.civilization_id):
+                if other.id == law.id or other.status.value not in (
+                        "active", "in_transition"):
+                    continue
+                depends = (
+                    law.id in getattr(other.canonical, "refs", ())
+                    if other.canonical is not None else False
+                ) or (bool(law.title) and law.title in other.raw_text)
+                if depends:
+                    count += 1
         return count
 
     # ================= chronology (§15.4) ===================================
@@ -277,6 +343,11 @@ class WorldServer:
         return {"turn_id": turn.id, "turn_span_years": turn.turn_span.years}
 
     def run_turn(self, path: str, body: dict) -> dict:
+        # Convenience: if no turn is open and the request supplies the
+        # schedule, open it first — one-call turn execution for clients.
+        if self.engine.current_turn is None and "started_at" in body \
+                and "simulation_cutoff_at" in body:
+            self.open_turn(path, body)
         report = self.engine.run_turn()
         # Publish the turn report (§13 step 22): raw numbers plus the
         # generated client view and queued illustration tasks.
@@ -309,15 +380,89 @@ class WorldServer:
     def list_laws(self, path: str, body: dict) -> dict:
         civ = body.get("civilization_id")
         laws = self.store.laws_of(civ) if civ else list(self.store._laws.values())
+        return {"laws": [self._law_json(l) for l in laws]}
+
+    def get_law_detail(self, path: str, body: dict) -> dict:
+        """GET /api/v1/laws/{id} — full client card (§16.2).
+
+        Shows everything §16.2 requires for each law: current version,
+        drafts, pending edits, version history, transition periods with the
+        REMAINING TIME IN GAME UNITS (years), tradition, norm conflicts and
+        folklore effects. All durations are reported in game time, never in
+        turn counts (§20 rule 9).
+        """
+        law_id = _path_id(path, "laws")
+        law = self.store.get_law(law_id)
+        civ_id = law.civilization_id
+
+        # --- drafts attached to this law (§3.3) ---
+        drafts = [
+            _draft_json(d) for d in self.store.list_drafts(civ_id)
+            if d.target_law_id == law_id
+        ]
+
+        # --- pending revisions: which slice will they join? (§15.3, §16.3) ---
+        pending = []
+        cutoff = (self.engine.current_turn.simulation_cutoff_at
+                  if self.engine.current_turn is not None else None)
+        for rev in self.store.revisions_for_law(law_id):
+            if rev.status != LawRevisionStatus.PENDING:
+                continue
+            will_apply = ("current_turn" if cutoff is not None
+                          and rev.received_at <= cutoff else "next_turn")
+            pending.append({**_revision_json(rev), "will_apply_in": will_apply})
+
+        # --- version history (§16.2) ---
+        history = [_revision_json(r) for r in self.store.version_history(law_id)]
+
+        # --- transitions & suspensions remaining in GAME time (§11.7, §16.2) ---
+        transitions = [
+            {"kind": e.kind.value, "remaining_years": e.remaining.years,
+             "payload": e.payload}
+            for e in self._effects_view()
+            if e.payload.get("law_id") == law_id
+            and e.kind in (TimedEffectKind.LAW_TRANSITION, TimedEffectKind.SUSPENSION)
+        ]
+
+        # --- norm conflicts against the active set (§4.3, §16.2) ---
+        from .core import kinds_conflict
+
+        conflicts = []
+        for other in self.store.laws_of(civ_id):
+            if other.id == law_id or other.canonical is None:
+                continue
+            if other.status.value not in ("active", "in_transition"):
+                continue
+            same_kind = (law.canonical is not None
+                         and other.canonical.kind == law.canonical.kind)
+            matrix_hit = (law.canonical is not None
+                          and kinds_conflict(law.canonical.kind, other.canonical.kind))
+            if same_kind or matrix_hit:
+                conflicts.append({"law_b": other.id, "title": other.title,
+                                  "description": "conflicts with an active law"})
+
+        # --- folklore effects touching this law's topic (§11.5, §16.2) ---
+        folklore = [
+            {"id": f.id, "spread": f.spread, "mutation": f.mutation,
+             "conflict_factor": f.conflict_factor}
+            for f in self.engine.folklore if f.topic == law_id
+        ]
+
         return {
-            "laws": [
-                {
-                    "id": l.id, "title": l.title, "status": l.status.value,
-                    "tradition": l.tradition, "age_years": l.age_years,
-                    "raw_text": l.raw_text,
-                }
-                for l in laws
-            ]
+            "law": self._law_json(law),
+            "drafts": drafts,
+            "pending_edits": pending,
+            "version_history": history,
+            "transitions": transitions,
+            "conflicts": conflicts,
+            "folklore_effects": folklore,
+        }
+
+    def _law_json(self, l: Law) -> dict:
+        return {
+            "id": l.id, "title": l.title, "status": l.status.value,
+            "tradition": l.tradition, "age_years": l.age_years,
+            "raw_text": l.raw_text,
         }
 
     def create_law(self, path: str, body: dict) -> dict:
@@ -338,9 +483,23 @@ class WorldServer:
 
     def add_treaty(self, path: str, body: dict) -> dict:
         eff = Treaty_as_effect(body)
-        self.timed_effects.append(eff)
-        self.engine.timed_effects = self.timed_effects
+        self.engine.timed_effects.append(eff)
         return {"treaty_id": eff.id, "duration_years": eff.remaining.years}
+
+    def declare_war(self, path: str, body: dict) -> dict:
+        """§13 step 17: start a war. Its fatigue clock runs in GAME time."""
+        import uuid as _uuid
+
+        war = War(
+            id=body.get("id") or str(_uuid.uuid4()),
+            world_id=body["world_id"],
+            attacker_id=body["attacker_id"],
+            defender_id=body["defender_id"],
+            started_year=self.chronology.current_year,
+            annual_fatigue_rate=float(body.get("annual_fatigue_rate", 0.01)),
+        )
+        self.engine.wars.append(war)
+        return {"war_id": war.id, "started_year": war.started_year}
 
     _ROUTES: dict = {}
 
@@ -369,12 +528,33 @@ def _normalize_path(path: str) -> str:
 
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
-                 "turns", "report", "api", "v1", "submit", "cancel", "treaties",
+                 "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
+                 "wars",
                  "civilizations", "cost_preview"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
     return prev in {"laws", "drafts", "revisions", "worlds", "treaties"}
+
+
+def _parse_action(value: str) -> LawUserAction:
+    """Accept both canonical enum names (§3.2 ``RepealLaw``) and snake_case
+    aliases (``repeal_law``) so clients never trip over casing."""
+    text = str(value)
+    try:
+        return LawUserAction(text)
+    except ValueError:
+        pass
+    try:
+        return LawUserAction[text.upper()]          # REPEAL_LAW form
+    except ValueError:
+        pass
+    # snake/kebab-case -> CamelCase member name ("repeal_law" -> "RepealLaw")
+    pascal = "".join(w.capitalize() for w in text.replace("-", "_").split("_"))
+    for member in LawUserAction:
+        if member.name.lower() == pascal.lower():
+            return member
+    raise ValueError(f"unknown law action: {value!r}") from None
 
 
 def _path_id(path: str, collection: str) -> str:
@@ -441,13 +621,20 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/submit$", WorldServer.submit_revision),
     ("POST", r"^/api/v1/laws/\{id\}/revisions/\{id\}/cancel$", WorldServer.cancel_revision),
     ("GET", r"^/api/v1/laws/pending$", WorldServer.get_pending),
+    # §4.3: снимок активных законов, который читает симуляция (инспектируется
+    # клиентом; правки со статусом IncludedInSimulation уже вошли в него).
+    ("GET", r"^/api/v1/laws/snapshot$", WorldServer.get_snapshot),
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),
     ("GET", r"^/api/v1/worlds/\{id\}/turns/report$", WorldServer.get_turn_report),
     ("GET", r"^/api/v1/laws$", WorldServer.list_laws),
     ("POST", r"^/api/v1/laws$", WorldServer.create_law),
+    # GET /api/v1/laws/{id} — карточка закона (§16.2): версия, черновики,
+    # ожидающие правки, история, переходные периоды, традиция, конфликты, фольклор.
+    ("GET", r"^/api/v1/laws/[^/]+$", WorldServer.get_law_detail),
     ("POST", r"^/api/v1/treaties$", WorldServer.add_treaty),
+    ("POST", r"^/api/v1/wars$", WorldServer.declare_war),
 ]
 
 WorldServer._ROUTES = {
