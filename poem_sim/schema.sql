@@ -84,3 +84,18 @@ CREATE TABLE IF NOT EXISTS folklore_items (
     distance_factor DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     conflict_factor DOUBLE PRECISION NOT NULL DEFAULT 0.0
 );
+
+-- Prejudices (§13 step 15): long-lived social biases; growth/decay are
+-- annual rates applied over the turn's GAME-time span (§20.9), never a
+-- function of real-world time of day (§20.4).
+CREATE TABLE IF NOT EXISTS prejudices (
+    id UUID PRIMARY KEY,
+    world_id UUID NOT NULL,
+    civilization_id UUID NOT NULL,
+    title TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '',
+    intensity DOUBLE PRECISION NOT NULL DEFAULT 0.1,
+    annual_growth DOUBLE PRECISION NOT NULL DEFAULT 0.004,
+    annual_decay DOUBLE PRECISION NOT NULL DEFAULT 0.002,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE
+);
