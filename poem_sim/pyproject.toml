@@ -15,5 +15,7 @@ test = ["pytest>=7"]
 [tool.setuptools.packages.find]
 include = ["poem*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+# NOTE: pytest configuration lives in pytest.ini at the repo root because
+# pytest.ini's addopts is processed early enough to disable the broken
+# system-installed libtmux plugin ("Marks cannot be applied to fixtures"),
+# whereas [tool.pytest.ini_options] here is not.
