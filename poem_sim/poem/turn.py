@@ -557,10 +557,14 @@ class TurnEngine:
             )
         if era_after != era_before:
             next_span = calculate_turn_span(self.chronology, list(self.civilizations.values()))
-            notices.append(
-                f"Внимание: благодаря развитию цивилизаций следующий ход охватит "
-                f"{next_span.years:g} лет вместо {span.years:g}."
-            )
+            # §16.1 — the warning is only meaningful when the interval actually
+            # changed; an era shift with identical span must not emit a noisy
+            # (and non-deterministic-looking) notice.
+            if next_span.years != span.years:
+                notices.append(
+                    f"Внимание: благодаря развитию цивилизаций следующий ход охватит "
+                    f"{next_span.years:g} лет вместо {span.years:g}."
+                )
 
         report = TurnReport(
             turn_id=turn.id,

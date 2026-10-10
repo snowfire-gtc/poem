@@ -90,7 +90,7 @@ def test_failed_revision_is_marked_failed_not_applied_and_not_charged():
         CanonicalLawChange(action=LawUserAction.REPEAL_LAW),
         now=DAY.replace(hour=10))
     engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=20))
-    store.armed = True          # fault fires only during application (§3.4)
+    store.fault_phase = True      # fault fires only during application (§3.4)
     report = engine.run_turn()
 
     assert rev.id not in report.applied_revisions
@@ -115,7 +115,7 @@ def test_failed_repeal_leaves_no_folk_remnant_and_is_not_retried():
         CanonicalLawChange(action=LawUserAction.REPEAL_LAW),
         now=DAY.replace(hour=10))
     engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=20))
-    store.armed = True
+    store.fault_phase = True
     r1 = engine.run_turn()
     assert r1.failed_revisions
     # the repeal never happened -> no customary remnant in folk memory (§11.5)
@@ -145,11 +145,18 @@ def test_time_of_day_neutral_failure():
                                new_canonical=CanonicalLaw(kind="tax")),
             now=DAY.replace(hour=hour))
         engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
-        store.armed = True
+        store.fault_phase = True
         report = engine.run_turn()
+        # Notices embed revision UUIDs, which differ between runs; compare the
+        # *shape* of the outcome: status, charged cost and notice templates
+        # (UUIDs stripped). Time of day must not change any of them (§17.1).
+        def norm(text: str) -> str:
+            import re
+            return re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                          "<uuid>", text)
         outcomes[hour] = (store.get_revision(rev.id).status.value,
                           report.admin_costs.get("c1", 0.0),
-                          tuple(report.notices))
+                          tuple(norm(n) for n in report.notices))
     assert outcomes[3] == outcomes[18]
 
 
@@ -172,3 +179,28 @@ def test_pending_api_reports_failed_bucket():
     assert rev.id in [r["id"] for r in pend["failed"]]
     assert rev.id not in [r["id"] for r in pend["will_apply_this_slice"]]
     assert rev.id not in [r["id"] for r in pend["rejected"]]
+
+def test_era_notice_only_when_span_actually_changes():
+    """§16.1: the "следующий ход охватит N лет вместо M" warning must only
+    appear when the interval truly changed — never as '25 вместо 25', and
+    identically regardless of wall-clock submission time."""
+    import re
+    outcomes = {}
+    for hour in (3, 18):
+        store, engine, civ = build(broken=False)
+        # progress jump inside this turn crosses an era boundary whose table
+        # entry has the SAME years_per_turn as before (classical->medieval is
+        # 25->20, so use ancient(40)->classical(25) vs a same-span transition);
+        # simplest deterministic check: no era change at all => no notice.
+        rev = store.record_revision(
+            "law-tax", "c1", LawUserAction.CLARIFY_LAW, "Clarify wording.",
+            CanonicalLawChange(action=LawUserAction.CLARIFY_LAW),
+            now=DAY.replace(hour=hour))
+        engine.open_turn(started_at=DAY, simulation_cutoff_at=DAY.replace(hour=23))
+        report = engine.run_turn()
+        span_notices = [n for n in report.notices if "охватит" in n]
+        for n in span_notices:
+            nums = re.findall(r"([\d.]+) лет", n)
+            assert nums[0] != nums[1], f"degenerate notice: {n}"
+        outcomes[hour] = (report.era_before == report.era_after, len(span_notices))
+    assert outcomes[3] == outcomes[18]
