@@ -23,6 +23,7 @@ from .core import (
     SimDuration,
     TimedEffect,
     TimedEffectKind,
+    War,
 )
 from .laws import LawStore
 from .pricing import cost_of_law_change
@@ -342,6 +343,21 @@ class WorldServer:
         self.engine.timed_effects = self.timed_effects
         return {"treaty_id": eff.id, "duration_years": eff.remaining.years}
 
+    def declare_war(self, path: str, body: dict) -> dict:
+        """§13 step 17: start a war. Its fatigue clock runs in GAME time."""
+        import uuid as _uuid
+
+        war = War(
+            id=body.get("id") or str(_uuid.uuid4()),
+            world_id=body["world_id"],
+            attacker_id=body["attacker_id"],
+            defender_id=body["defender_id"],
+            started_year=self.chronology.current_year,
+            annual_fatigue_rate=float(body.get("annual_fatigue_rate", 0.01)),
+        )
+        self.engine.wars.append(war)
+        return {"war_id": war.id, "started_year": war.started_year}
+
     _ROUTES: dict = {}
 
 
@@ -370,6 +386,7 @@ def _normalize_path(path: str) -> str:
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "turns", "report", "api", "v1", "submit", "cancel", "treaties",
+                 "wars",
                  "civilizations", "cost_preview"}
     if token in known_ids:
         return False
@@ -448,6 +465,7 @@ _ROUTE_TABLE = [
     ("GET", r"^/api/v1/laws$", WorldServer.list_laws),
     ("POST", r"^/api/v1/laws$", WorldServer.create_law),
     ("POST", r"^/api/v1/treaties$", WorldServer.add_treaty),
+    ("POST", r"^/api/v1/wars$", WorldServer.declare_war),
 ]
 
 WorldServer._ROUTES = {

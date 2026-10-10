@@ -46,6 +46,8 @@ from .core import (
     SimDuration,
     TimedEffect,
     TimedEffectKind,
+    Treaty,
+    War,
     Turn,
     TurnLawSnapshot,
     TurnStatus,
@@ -87,6 +89,8 @@ class TurnReport:
     economy: dict[str, dict[str, float]] = field(default_factory=dict)
     folklore: dict[str, dict[str, float]] = field(default_factory=dict)
     prejudices: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 15
+    diplomacy: list[dict] = field(default_factory=list)           # §13 step 16
+    wars: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 17
     admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
     notices: list[str] = field(default_factory=list)
     view: dict = field(default_factory=dict)                      # §13 step 19
@@ -115,6 +119,9 @@ class TurnEngine:
         self.folklore: list[FolkloreItem] = []
         # Prejudices (§13 step 15): long-lived social biases scaled by game time.
         self.prejudices: list[Prejudice] = []
+        # Wars (§13 step 17): conflicts measured in GAME time; fatigue scales
+        # with the turn span, never with wall-clock time of day (§20.4).
+        self.wars: list[War] = []
         # per-turn prejudice deltas (§13 step 15), keyed by prejudice id
         self._prejudice_delta: dict[str, float] = {}
         self.turns: list[Turn] = []
@@ -343,6 +350,54 @@ class TurnEngine:
                 survivors.append(eff)
         self.timed_effects = survivors
 
+        # Step 16 (§13): diplomacy — report the surviving treaties' remaining
+        # duration in GAME time (§11.6). Durations are stored in years, never
+        # in turn counts; a 100-year treaty ticks down by the turn span each
+        # turn and expires by game time (3 turns at 40 y/turn, 100 at 1 y/turn).
+        diplomacy: list[dict] = []
+        for eff in self.timed_effects:
+            if isinstance(eff, Treaty) or eff.kind == TimedEffectKind.TREATY:
+                diplomacy.append({
+                    "treaty_id": eff.id,
+                    "kind": eff.payload.get("treaty_kind", "peace"),
+                    "civilization_id": eff.civilization_id,
+                    "remaining_years": max(eff.remaining.years, 0.0),
+                })
+            elif eff.kind == TimedEffectKind.TRAVEL:
+                diplomacy.append({
+                    "travel_id": eff.id,
+                    "kind": "envoy_travel",
+                    "civilization_id": eff.civilization_id,
+                    "remaining_years": max(eff.remaining.years, 0.0),
+                })
+
+        # Step 17 (§13): wars — fatigue accumulates proportionally to the
+        # turn's GAME-time span with diminishing gains (§19.1: not every
+        # process scales linearly). An exhausted side sues for peace: the war
+        # ends and a peace treaty is concluded for 25 game-years — its clock
+        # then runs in game time like every other duration (§11.6).
+        wars: dict[str, dict[str, float]] = {}
+        for war in self.wars:
+            if not war.active:
+                continue
+            war.tick(span.years)
+            if war.exhausted:
+                war.active = False
+                self.timed_effects.append(Treaty(
+                    id=str(uuid.uuid4()), world_id=self.world_id,
+                    civilization_id=war.attacker_id,
+                    kind=TimedEffectKind.TREATY,
+                    remaining=SimDuration(years=25.0),
+                    payload={"treaty_kind": "peace",
+                             "ended_war_id": war.id,
+                             "other_party": war.defender_id},
+                ))
+            wars[war.id] = {
+                "active": 1.0 if war.active else 0.0,
+                "fatigue_attacker": round(war.fatigue_attacker, 4),
+                "fatigue_defender": round(war.fatigue_defender, 4),
+            }
+
         # Step 14 (§11.5): update folklore — spread & mutation scale with the
         # turn's GAME-time span, never with real-world time of day (§20.4).
         # Laws repealed in this very turn also leave customary remnants that
@@ -460,6 +515,8 @@ class TurnEngine:
             economy=economy,
             folklore=folklore,
             prejudices=prejudices,
+            diplomacy=diplomacy,
+            wars=wars,
             admin_costs=admin_costs,
             notices=notices,
         )

@@ -307,6 +307,42 @@ class TimedEffectKind(enum.Enum):
     LAW_TRANSITION = "law_transition"
     TRAVEL = "travel"
     SUSPENSION = "suspension"
+    WAR = "war"
+
+
+@dataclass
+class War:
+    """An ongoing conflict between civilizations (§13 step 17).
+
+    Wars live in GAME time like every other long effect (§20.9): fatigue
+    accumulates proportionally to the turn span, so a 40-year ancient turn
+    exhausts a society far more than a 1-year modern turn. Nothing here
+    depends on real-world time of day (§20.4).
+    """
+
+    id: str
+    world_id: WorldId
+    attacker_id: CivilizationId
+    defender_id: CivilizationId
+    started_year: float = 0.0
+    active: bool = True
+    fatigue_attacker: float = 0.0     # accumulated social exhaustion 0..1+
+    fatigue_defender: float = 0.0
+    annual_fatigue_rate: float = 0.01  # per game-year while active
+
+    def tick(self, span_years: float) -> None:
+        """Advance one turn interval; heavy processes are NOT linear (§19.1):
+        fatigue gains diminish as exhaustion grows."""
+        if not self.active:
+            return
+        self.fatigue_attacker += self.annual_fatigue_rate * span_years / (
+            1.0 + self.fatigue_attacker)
+        self.fatigue_defender += self.annual_fatigue_rate * span_years / (
+            1.0 + self.fatigue_defender)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.fatigue_attacker >= 1.0 and self.fatigue_defender >= 1.0
 
 
 @dataclass
