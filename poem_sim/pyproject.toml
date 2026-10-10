@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poem-sim"
+version = "0.4.0"
+description = "Poem: a civ-like game using neural networks — turn simulation core (Design Doc Rev 3: server-side law revisions, no time-of-day effects, Civilization-like dynamic turn intervals)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["poem*"]
+
+# NOTE: pytest configuration lives in pytest.ini at the repo root because
+# pytest.ini's addopts is processed early enough to disable the broken
+# system-installed libtmux plugin ("Marks cannot be applied to fixtures"),
+# whereas [tool.pytest.ini_options] here is not.

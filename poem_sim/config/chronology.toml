@@ -1,0 +1,58 @@
+# World chronology configuration (Design Doc Rev 3, §8.1)
+# Intervals can be changed here without touching code (TASK-065).
+
+[chronology]
+mode = "civilization_like"
+speed = "standard"
+era_source = "median_active_civilizations"
+
+[chronology.calendar]
+year_length_days = 365.25
+seasons_per_year = 4
+
+[[chronology.intervals]]
+era = "dawn"
+years_per_turn = 60
+
+[[chronology.intervals]]
+era = "ancient"
+years_per_turn = 40
+
+[[chronology.intervals]]
+era = "classical"
+years_per_turn = 25
+
+[[chronology.intervals]]
+era = "medieval"
+years_per_turn = 20
+
+[[chronology.intervals]]
+era = "renaissance"
+years_per_turn = 10
+
+[[chronology.intervals]]
+era = "industrial"
+years_per_turn = 5
+
+[[chronology.intervals]]
+era = "modern"
+years_per_turn = 2
+
+[[chronology.intervals]]
+era = "atomic"
+years_per_turn = 1
+
+[[chronology.intervals]]
+era = "information"
+years_per_turn = 0.5
+
+[[chronology.intervals]]
+era = "planetary"
+years_per_turn = 0.25
+
+# Speed multipliers (§8.2): effective_years_per_turn = base * multiplier
+[chronology.speeds]
+quick_multiplier = 0.67
+standard_multiplier = 1.0
+epic_multiplier = 1.5
+marathon_multiplier = 3.0
