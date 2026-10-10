@@ -233,3 +233,59 @@ def test_snapshot_endpoint_exposes_turn_law_snapshot():
     assert run["status"] == 200
     snap2 = srv.handle("GET", "/api/v1/laws/snapshot")
     assert rev["id"] in snap2["civilizations"][0]["pending_amendments"]
+
+
+def test_submit_draft_via_revision_submit_endpoint():
+    """§15.2 + §3.2 SubmitDraft: POST .../revisions/{id}/submit with a
+    draft_id converts the validated server-side draft into an official
+    revision (Pending; cutoff decides its turn, time of day never does)."""
+    srv = server_with_law()
+    created = srv.handle("POST", "/api/v1/laws/drafts", {
+        "civilization_id": "c1", "raw_text": "Exempt small settlements.",
+        "target_law_id": "law-tax"})
+    draft_id = created["draft"]["id"]
+    # validate it (§3.3: only Validated/ReadyForPreview can be submitted)
+    upd = srv.handle("PUT", f"/api/v1/laws/drafts/{draft_id}",
+                     {"canonical_draft": {"kind": "tax"}})
+    assert upd["draft"]["status"] == "Validated"
+
+    sub = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/new/submit",
+                     {"draft_id": draft_id,
+                      "now": DAY.replace(hour=3).isoformat()})
+    assert sub["status"] == 200
+    rev = sub["revision"]
+    assert rev["action"] == "SubmitDraft"
+    assert rev["status"] == "Pending"
+    assert "Время подачи не влияет" in sub["notice"]   # §16.3, no penalty
+
+    # unvalidated drafts must not convert through the API either
+    d2 = srv.handle("POST", "/api/v1/laws/drafts",
+                    {"civilization_id": "c1", "raw_text": "wip",
+                     "target_law_id": "law-tax"})["draft"]["id"]
+    bad = srv.handle("POST", "/api/v1/laws/law-tax/revisions/new/submit",
+                     {"draft_id": d2})
+    assert bad["status"] == 400
+
+
+def test_draft_submission_applies_before_cutoff_same_cost_as_evening():
+    """§17.1 extended to the SubmitDraft path: identical draft submitted at
+    03:00 and 18:00 yields identical cost/status/application."""
+    outcomes = {}
+    for hour in (3, 18):
+        srv = server_with_law()
+        cutoff = DAY.replace(hour=20)
+        srv.handle("POST", "/api/v1/worlds/w1/turns/open", {
+            "started_at": DAY.isoformat(),
+            "simulation_cutoff_at": cutoff.isoformat()})
+        draft_id = srv.handle("POST", "/api/v1/laws/drafts", {
+            "civilization_id": "c1", "raw_text": "Lower rate for small hearths.",
+            "target_law_id": "law-tax"})["draft"]["id"]
+        srv.handle("PUT", f"/api/v1/laws/drafts/{draft_id}",
+                   {"canonical_draft": {"kind": "tax", "effect": {"rate": 1}}})
+        rev = srv.handle("POST", "/api/v1/laws/law-tax/revisions/new/submit", {
+            "draft_id": draft_id,
+            "now": DAY.replace(hour=hour).isoformat()})["revision"]
+        run = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {})
+        outcomes[hour] = (rev["cost"], rev["status"],
+                          rev["id"] in run["applied_revisions"])
+    assert outcomes[3] == outcomes[18]

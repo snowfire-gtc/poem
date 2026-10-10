@@ -157,13 +157,37 @@ class WorldServer:
         return {"revision": _revision_json(rev), "notice": notice}
 
     def submit_revision(self, path: str, body: dict) -> dict:
+        """POST /api/v1/laws/{id}/revisions/{revision_id}/submit (§15.2).
+
+        Two roles, mirroring §3.2/§3.3 (``LawUserAction.SubmitDraft``):
+
+        * ``{"draft_id": ...}`` in the body — convert a server-side draft
+          into an official revision (validated drafts only, §3.3); the
+          created revision is Pending and its turn is decided by the
+          logical cutoff alone (§4.1), never by time of day (§2).
+        * otherwise — confirm an already-recorded revision: it stays
+          Pending; the cutoff decides whether it joins this or the next
+          slice (§4.4). No penalty either way.
+        """
         law_id = _path_id(path, "laws")
         revision_id = _path_id(path, "revisions")
-        rev = self.store.get_revision(revision_id)
-        if rev.law_id != law_id:
-            raise ValueError("revision does not belong to law")
+        draft_id = body.get("draft_id")
+        if draft_id is not None:
+            rev = self.store.submit_draft(draft_id, now=_parse_dt(body.get("now")))
+            if rev.law_id != law_id:
+                raise ValueError("draft targets another law")
+        else:
+            rev = self.store.get_revision(revision_id)
+            if rev.law_id != law_id:
+                raise ValueError("revision does not belong to law")
         # "Submit" here = confirm inclusion attempt; cutoff decides the turn.
-        return {"revision": _revision_json(rev), "notice": ACCEPTED_NOTICE}
+        return {
+            "revision": _revision_json(rev),
+            "notice": ACCEPTED_NOTICE + (
+                "\nОна будет учтена в следующем ходе.\nШтрафа за время суток нет."
+                if rev.deferred_to_next_turn else ""
+            ),
+        }
 
     def cancel_revision(self, path: str, body: dict) -> dict:
         revision_id = _path_id(path, "revisions")
