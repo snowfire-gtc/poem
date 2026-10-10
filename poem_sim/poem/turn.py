@@ -27,6 +27,7 @@ from .chronology import (
     folklore_mutation_gain,
     folklore_spread_gain,
     population_growth_this_turn,
+    prejudice_update,
     production_this_turn,
     research_progress_this_turn,
     tradition_gain,
@@ -37,6 +38,7 @@ from .core import (
     FolkloreItem,
     Law,
     LawConflict,
+    Prejudice,
     LawRevision,
     LawRevisionStatus,
     LawStatus,
@@ -84,6 +86,7 @@ class TurnReport:
     expired_effects: list[str] = field(default_factory=list)
     economy: dict[str, dict[str, float]] = field(default_factory=dict)
     folklore: dict[str, dict[str, float]] = field(default_factory=dict)
+    prejudices: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 15
     admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
     notices: list[str] = field(default_factory=list)
     view: dict = field(default_factory=dict)                      # §13 step 19
@@ -110,6 +113,10 @@ class TurnEngine:
         self.timed_effects: list[TimedEffect] = timed_effects or []
         # Folklore corpus (§11.5): spread/mutation scale with GAME time only.
         self.folklore: list[FolkloreItem] = []
+        # Prejudices (§13 step 15): long-lived social biases scaled by game time.
+        self.prejudices: list[Prejudice] = []
+        # per-turn prejudice deltas (§13 step 15), keyed by prejudice id
+        self._prejudice_delta: dict[str, float] = {}
         self.turns: list[Turn] = []
         self.current_turn: Turn | None = None
         # ids of timed effects that existed before the current turn started
@@ -367,6 +374,24 @@ class TurnEngine:
                 "mutation_gain": m_gain,
             }
 
+        # Step 15 (§13): update prejudices — long-lived social biases that
+        # intensify while their underlying conflict is alive and fade once it
+        # is resolved. All changes scale with the turn's GAME-time span
+        # (§20.9); a 40-year ancient turn moves them far more than a 1-year
+        # modern turn. Wall-clock time of day never enters this step (§20.4).
+        # Repealing a contested law marks its prejudice as resolving: folk
+        # hostility toward the targeted group decays from then on.
+        for p in self.prejudices:
+            if not p.resolved and p.target in remnant_topics:
+                p.resolved = True
+            delta = prejudice_update(p, span)
+            self._prejudice_delta[p.id] = delta
+        prejudices: dict[str, dict[str, float]] = {
+            p.id: {"intensity": p.intensity, "delta": self._prejudice_delta[p.id],
+                   "resolved": 1.0 if p.resolved else 0.0}
+            for p in self.prejudices
+        }
+
         # Mark included revisions as Applied.
         for rev_id in applied:
             self.store.mark_applied(rev_id)
@@ -434,6 +459,7 @@ class TurnEngine:
             expired_effects=expired,
             economy=economy,
             folklore=folklore,
+            prejudices=prejudices,
             admin_costs=admin_costs,
             notices=notices,
         )

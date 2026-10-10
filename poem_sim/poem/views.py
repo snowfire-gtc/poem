@@ -111,6 +111,10 @@ def build_turn_view(report, chronology, civilizations) -> dict:
         "laws": laws_section,
         "economy": economy_section,
         "folklore": folklore_section,
+        "prejudices": [
+            {"prejudice_id": pid, **{k: round(v, 4) for k, v in m.items()}}
+            for pid, m in report.prejudices.items()
+        ],                                    # §13 step 15
         "admin_costs": report.admin_costs,
         "applied_revisions": report.applied_revisions,
         "deferred_revisions": report.deferred_revisions,

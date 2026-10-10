@@ -292,3 +292,23 @@ def folklore_mutation_gain(
 ) -> float:
     """§11.5"""
     return annual_mutation_rate * span.years * oral_strength * distance_factor * conflict_factor
+
+
+def prejudice_update(p, span: SimDuration) -> float:
+    """§13 step 15 — update one prejudice over the turn's GAME time.
+
+    While the underlying conflict is alive the bias intensifies at its
+    annual growth rate; once resolved (law repealed, treaty expired, war
+    ended) it slowly fades. Scales linearly with the turn span, so a 40-year
+    ancient turn moves prejudices much more than a 1-year modern turn —
+    exactly like every other long effect (§20.9). Real-world clock time of
+    day never enters this function (§20.4).
+
+    Returns the delta applied to ``p.intensity``.
+    """
+    if p.resolved:
+        delta = -p.annual_decay * span.years
+    else:
+        delta = p.annual_growth * span.years
+    p.intensity = max(0.0, p.intensity + delta)
+    return delta

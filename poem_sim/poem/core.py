@@ -310,6 +310,26 @@ class TimedEffectKind(enum.Enum):
 
 
 @dataclass
+class Prejudice:
+    """A collective bias of a civilization (§13 step 15).
+
+    Prejudices live in GAME time like every other long effect (§20.9): they
+    intensify while the underlying conflict is alive and fade once it is
+    resolved (repealed law, expired treaty, ended war). Nothing here depends
+    on real-world time of day (§20.4).
+    """
+
+    id: str
+    civilization_id: CivilizationId
+    title: str
+    target: str = ""                 # e.g. folk group, foreign civ, custom
+    intensity: float = 0.1           # 0..1+
+    annual_growth: float = 0.004     # per game-year while unresolved
+    annual_decay: float = 0.002      # per game-year once resolved
+    resolved: bool = False
+
+
+@dataclass
 class TimedEffect:
     id: str
     world_id: WorldId
