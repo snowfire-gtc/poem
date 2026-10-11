@@ -190,6 +190,12 @@ print(report["view"]["dashboard"])
 ### 5.3. Типичные HTTP-вызовы клиента (удалённый режим)
 
 ```bash
+# настройка мира: зарегистрировать цивилизацию (эпоха и интервал хода
+# пересчитываются сразу после POST, §9)
+curl -s -X POST $API/api/v1/worlds/w1/civilizations \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "c1", "name": "Ромашки", "progress": 0.25}'
+
 # хроника мира
 curl -s $API/api/v1/worlds/w1/chronology
 

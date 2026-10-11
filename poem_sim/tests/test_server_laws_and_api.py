@@ -349,3 +349,66 @@ def test_reject_only_applies_to_pending_and_is_time_of_day_neutral():
         again = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/{rev_id}/submit",
                            {"reject_reason": "again"})
         assert again["status"] == 400   # only Pending revisions can be rejected
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/worlds/{id}/civilizations — HTTP world setup (§9)
+# ---------------------------------------------------------------------------
+
+def test_create_civilization_endpoint_drives_era_and_turn_span():
+    """A purely-HTTP client can populate the world: registering a civ via
+    POST updates era determination and the next turn interval (§9/§10.1)."""
+    srv = WorldServer("w1")
+    before = srv.handle("GET", "/api/v1/worlds/w1/chronology")
+    assert before["status"] == 200
+    assert before["current_era"] == "dawn"
+    assert before["next_turn_span"]["years"] == 60.0
+
+    created = srv.handle("POST", "/api/v1/worlds/w1/civilizations", {
+        "id": "c-alpha", "name": "Alpha", "progress": 2.5})
+    assert created["status"] == 200
+    assert created["civilization"]["id"] == "c-alpha"
+    assert created["civilization"]["active"] is True
+
+    after = srv.handle("GET", "/api/v1/worlds/w1/chronology")
+    assert after["current_era"] == "planetary"
+    assert after["next_turn_span"]["years"] == 0.25
+
+    # The civilization also reaches the turn engine: running a turn advances
+    # the chronology by the new era's interval, not the default one.
+    run = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {
+        "started_at": DAY.isoformat(),
+        "simulation_cutoff_at": DAY.replace(hour=23).isoformat()})
+    assert run["status"] == 200
+    assert run["era_before"] == "dawn"
+    assert run["era_after"] == "planetary"
+    assert run["years_elapsed"] == 0.25
+
+
+def test_create_civilization_rejects_duplicate_id():
+    srv = WorldServer("w1")
+    ok = srv.handle("POST", "/api/v1/worlds/w1/civilizations", {"id": "c1"})
+    assert ok["status"] == 200
+    dup = srv.handle("POST", "/api/v1/worlds/w1/civilizations", {"id": "c1"})
+    assert dup["status"] == 400
+    assert "already exists" in dup["error"]
+
+
+def test_create_civilization_accepts_full_field_set():
+    """All Civilization fields are settable through the API so weighted
+    era sources and economy simulation get real inputs (§9, §13)."""
+    srv = WorldServer("w1")
+    r = srv.handle("POST", "/api/v1/worlds/w1/civilizations", {
+        "id": "c1", "name": "Beta", "progress": 1.0, "active": False,
+        "population": 5000.0, "annual_production_rate": 12.0,
+        "annual_growth_rate": 0.01, "annual_research_rate": 3.0,
+        "culture_modifier": 1.2, "technology_modifier": 0.9,
+        "administrative_budget": 7.5, "research_to_progress": 5e-4})
+    assert r["status"] == 200
+    civ = srv.civilizations["c1"]
+    assert civ.population == 5000.0
+    assert civ.active is False
+    assert civ.annual_research_rate == 3.0
+    # An inactive civ must not count toward the median-era source (§9):
+    chrono = srv.handle("GET", "/api/v1/worlds/w1/chronology")
+    assert chrono["current_era"] == "dawn"

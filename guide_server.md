@@ -229,7 +229,8 @@ async def create_draft(body: dict):
 | GET | `/laws/{id}/revisions` | история ревизий закона |
 | GET | `/laws/pending` | какие правки войдут в следующий срез, вошли в текущий, перезаписаны, отклонены |
 | GET | `/laws/snapshot` | снимок активных законов, который читает симуляция (§4.3) |
-| GET | `/worlds/{id}/chronology` | текущий ход/год/сезон/эпоха + прогноз интервала следующего хода |
+| GET | `/worlds/{id}/chronology` | текущий ход/год/сезон/эпоха + прогноз интервала следующего хода (эпоха пересчитывается по зарегистрированным цивилизациям, §9) |
+| POST | `/worlds/{id}/civilizations` | зарегистрировать цивилизацию (`id`, `name`, `progress`; опц. `active`, `population`, `annual_production_rate`, `annual_growth_rate`, `annual_research_rate`, `culture_modifier`, `technology_modifier`, `administrative_budget`, `research_to_progress`). Повторный `id` → 400. Цивилизации определяют эпоху мира и интервал хода |
 | POST | `/worlds/{id}/turns/open` | открыть ход (`started_at`, `simulation_cutoff_at`, `seed`) |
 | POST | `/worlds/{id}/turns/run` | просимулировать и опубликовать отчёт (допускается one-call: можно передать `started_at`+`simulation_cutoff_at` сразу) |
 | GET | `/worlds/{id}/turns/report` | последний опубликованный отчёт хода |

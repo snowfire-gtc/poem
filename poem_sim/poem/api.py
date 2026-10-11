@@ -83,6 +83,40 @@ class WorldServer:
         self.civilizations[civ.id] = civ
         self.engine.civilizations[civ.id] = civ
 
+    # ================= civilizations (setup / §9 era source) ================
+
+    def create_civilization(self, path: str, body: dict) -> dict:
+        """POST /api/v1/worlds/{id}/civilizations — register a civilization.
+
+        Civilizations drive era determination (§9): their ``progress``
+        decides the world era and therefore the Civilization-like turn
+        interval (§6.2). Without this route a purely HTTP client could not
+        populate the world at all (era sources like
+        ``weighted_average`` need population, research needs rates), so
+        setup must be reachable through the API too.
+        """
+        civ = Civilization(
+            id=body["id"],
+            name=body.get("name", ""),
+            progress=float(body.get("progress", 0.0)),
+            active=bool(body.get("active", True)),
+            population=float(body.get("population", 1000.0)),
+            annual_production_rate=float(body.get("annual_production_rate", 0.0)),
+            annual_growth_rate=float(body.get("annual_growth_rate", 0.005)),
+            annual_research_rate=float(body.get("annual_research_rate", 0.0)),
+            culture_modifier=float(body.get("culture_modifier", 1.0)),
+            technology_modifier=float(body.get("technology_modifier", 1.0)),
+            administrative_budget=float(body.get("administrative_budget", 0.0)),
+            research_to_progress=float(body.get("research_to_progress", 1e-4)),
+        )
+        if civ.id in self.civilizations:
+            raise ValueError(f"civilization {civ.id} already exists")
+        self.add_civilization(civ)
+        return {"civilization": {
+            "id": civ.id, "name": civ.name, "progress": civ.progress,
+            "active": civ.active, "population": civ.population,
+        }}
+
     # ------------------------------------------------------------- handlers
 
     def handle(self, method: str, path: str, body: dict | None = None) -> dict:
@@ -462,15 +496,19 @@ class WorldServer:
     # ================= chronology (§15.4) ===================================
 
     def get_chronology(self, path: str, body: dict) -> dict:
-        from .chronology import calculate_turn_span
+        from .chronology import calculate_turn_span, determine_world_era
 
         ch = self.chronology
-        next_span = calculate_turn_span(ch, list(self.civilizations.values()))
+        civs = list(self.civilizations.values())
+        next_span = calculate_turn_span(ch, civs)
         return {
             "current_turn": ch.current_turn,
             "current_year": ch.current_year,
             "current_season": ch.current_season.value,
-            "current_era": ch.current_era.value,
+            # Live era (§9): re-derived from the registered civilizations so
+            # that setup via POST .../civilizations is reflected immediately,
+            # even before the first turn advances chronology.
+            "current_era": determine_world_era(ch, civs).value,
             "next_turn_span": {
                 "years": next_span.years,
                 "seasons": next_span.seasons,
@@ -822,6 +860,9 @@ _ROUTE_TABLE = [
     # §4.3: снимок активных законов, который читает симуляция (инспектируется
     # клиентом; правки со статусом IncludedInSimulation уже вошли в него).
     ("GET", r"^/api/v1/laws/snapshot$", WorldServer.get_snapshot),
+    # Регистрация цивилизаций при настройке мира: без неё чисто HTTP-клиент
+    # не может populate мир (§9 — эпоха определяется по цивилизациям).
+    ("POST", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.create_civilization),
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),
