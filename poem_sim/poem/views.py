@@ -24,13 +24,22 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ImageTask:
-    """A queued illustration request for one turn (§13 step 20)."""
+    """A queued illustration request for one turn (§13 step 20).
+
+    Tasks are consumed only by renderer workers running on the server's own
+    video cards; nothing is ever delegated to external generation services.
+    ``claimed_by``/``lease_expires_at`` implement a lease so a crashed
+    worker's task returns to the queue instead of being lost.
+    """
 
     id: str
     world_id: str
     turn_id: str
     prompt: str
     status: str = "queued"          # queued | running | done | failed
+    claimed_by: str | None = None   # local GPU worker holding the lease
+    lease_expires_at: float | None = None  # unix ts; None when not running
+    asset_ref: str | None = None    # server-local path, filled on success
     payload: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
@@ -40,6 +49,9 @@ class ImageTask:
             "turn_id": self.turn_id,
             "prompt": self.prompt,
             "status": self.status,
+            "claimed_by": self.claimed_by,
+            "lease_expires_at": self.lease_expires_at,
+            "asset_ref": self.asset_ref,
             "payload": self.payload,
         }
 

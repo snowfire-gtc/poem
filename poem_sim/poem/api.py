@@ -8,6 +8,7 @@ turn engine (i.e. all state is server-side, §20 rule 1).
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -31,6 +32,21 @@ from .core import (
 from .laws import LawStore
 from .pricing import cost_of_law_change
 from .turn import ACCEPTED_NOTICE, DEFERRED_NOTICE, TurnEngine
+
+# Local GPU renderers renew this lease while a diffusion job runs; expired
+# leases (crashed worker) release the task back to the queue (§13 step 20).
+IMAGE_LEASE_SECONDS_DEFAULT = 600.0
+
+
+def _expire_image_leases(queue: list) -> None:
+    """Return running tasks whose lease has expired back to ``queued``."""
+    now = time.time()
+    for t in queue:
+        if (t.status == "running" and t.lease_expires_at is not None
+                and t.lease_expires_at <= now):
+            t.status = "queued"
+            t.claimed_by = None
+            t.lease_expires_at = None
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -689,6 +705,7 @@ class WorldServer:
 
     def list_image_tasks(self, path: str, body: dict) -> dict:
         """GET /api/v1/worlds/{id}/images — poll illustration progress (§16)."""
+        _expire_image_leases(self.engine.image_queue)  # reclaim crashed workers
         status_filter = body.get("status")
         tasks = [t.to_json() for t in self.engine.image_queue]
         if status_filter:
@@ -696,27 +713,57 @@ class WorldServer:
         return {"tasks": tasks, "pending": sum(1 for t in tasks if t["status"] == "queued")}
 
     def claim_image_task(self, path: str, body: dict) -> dict:
-        """POST /api/v1/images/{task_id}/claim — renderer takes one job.
+        """POST /api/v1/images/{task_id}/claim — local GPU worker takes one job.
 
         queued -> running; claiming an already-running/finished task is a
         no-op error so parallel renderers never double-process (§13 step 20).
+        Images are rendered exclusively on the server's own video cards by
+        trusted local workers — no external generation services (§20.4).
+        A lease (claimed_by/lease_expires_at) lets crashed workers be
+        detected: expired leases release the task back to the queue.
         """
         task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
         for t in self.engine.image_queue:
             if t.id == task_id:
                 if t.status != "queued":
                     raise ValueError(f"task {task_id} is not claimable (status={t.status})")
                 t.status = "running"
+                t.claimed_by = str(body.get("worker_id", "worker"))
+                t.lease_expires_at = time.time() + float(
+                    body.get("lease_seconds", IMAGE_LEASE_SECONDS_DEFAULT)
+                )
+                return {"task": t.to_json()}
+        raise ValueError(f"unknown image task: {task_id}")
+
+    def heartbeat_image_task(self, path: str, body: dict) -> dict:
+        """POST /api/v1/images/{task_id}/heartbeat — extend the lease.
+
+        Long renders (high-res diffusion on local VRAM) renew their lease so
+        the scheduler does not reclaim a task that is still progressing.
+        """
+        task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                if t.status != "running":
+                    raise ValueError(f"task {task_id} is not running (status={t.status})")
+                t.lease_expires_at = time.time() + float(
+                    body.get("lease_seconds", IMAGE_LEASE_SECONDS_DEFAULT)
+                )
                 return {"task": t.to_json()}
         raise ValueError(f"unknown image task: {task_id}")
 
     def complete_image_task(self, path: str, body: dict) -> dict:
-        """POST /api/v1/images/{task_id}/complete — renderer reports verdict.
+        """POST /api/v1/images/{task_id}/complete — worker reports verdict.
 
         running -> done | failed, with the produced asset reference stored on
         the task payload for the published report (§13 steps 20–22).
+        ``asset_ref`` must point at storage served by this same server
+        (local disk / internal object store), never an external service.
         """
         task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
         for t in self.engine.image_queue:
             if t.id == task_id:
                 if t.status != "running":
@@ -724,7 +771,9 @@ class WorldServer:
                 success = bool(body.get("success", True))
                 t.status = "done" if success else "failed"
                 if body.get("asset_ref"):
-                    t.payload["asset_ref"] = body["asset_ref"]
+                    t.asset_ref = str(body["asset_ref"])
+                t.claimed_by = None
+                t.lease_expires_at = None
                 return {"task": t.to_json()}
         raise ValueError(f"unknown image task: {task_id}")
 
@@ -762,7 +811,7 @@ def _normalize_path(path: str) -> str:
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
-                 "wars", "status", "images", "claim", "complete",
+                 "wars", "status", "images", "claim", "complete", "heartbeat",
                  "civilizations", "cost_preview"}
     if token in known_ids:
         return False
@@ -877,6 +926,7 @@ _ROUTE_TABLE = [
     # §13 step 20: иллюстрации хроники — очередь задач на генерацию.
     ("GET", r"^/api/v1/worlds/\{id\}/images$", WorldServer.list_image_tasks),
     ("POST", r"^/api/v1/images/\{id\}/claim$", WorldServer.claim_image_task),
+    ("POST", r"^/api/v1/images/\{id\}/heartbeat$", WorldServer.heartbeat_image_task),
     ("POST", r"^/api/v1/images/\{id\}/complete$", WorldServer.complete_image_task),
 ]
 

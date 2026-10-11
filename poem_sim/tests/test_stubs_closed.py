@@ -113,7 +113,7 @@ def test_image_tasks_are_queued_and_progress_via_api():
     done = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
                       {"success": True, "asset_ref": "assets/turn1_hero.png"})
     assert done["task"]["status"] == "done"
-    assert done["task"]["payload"]["asset_ref"] == "assets/turn1_hero.png"
+    assert done["task"]["asset_ref"] == "assets/turn1_hero.png"
 
     failed = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete", {})
     assert failed["status"] == 400   # already finished
@@ -128,3 +128,77 @@ def test_unknown_image_task_is_rejected():
     srv = make_server()
     res = srv.handle("POST", "/api/v1/images/nope/claim", {})
     assert res["status"] == 400
+
+
+def _run_turn(srv):
+    """Open and cut one logical turn through the public HTTP routes (§16)."""
+    srv.handle("POST", "/api/v1/worlds/w1/turns/open", {
+        "started_at": DAY.isoformat(),
+        "simulation_cutoff_at": DAY.replace(hour=23).isoformat(),
+    })
+    res = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {})
+    assert res["status"] == 200, res
+    return res
+
+
+def _queued_hero(srv):
+    tasks = srv.handle("GET", "/api/v1/worlds/w1/images")["tasks"]
+    return next(t for t in tasks if t["payload"]["kind"] == "hero")
+
+
+def test_image_claim_records_worker_lease():
+    """Local GPU workers hold an exclusive lease on a claimed task."""
+    srv = make_server()
+    # produce image tasks for turn 1
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    res = srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+                     {"worker_id": "gpu-renderer-1", "lease_seconds": 30})
+    task = res["task"]
+    assert task["status"] == "running"
+    assert task["claimed_by"] == "gpu-renderer-1"
+    assert task["lease_expires_at"] is not None
+
+    hb = srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat",
+                    {"lease_seconds": 60})
+    assert hb["status"] == 200
+    assert hb["task"]["lease_expires_at"] >= task["lease_expires_at"]
+
+    bad = srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat", {})
+    # heartbeat after completion is invalid; complete while running is ok
+    fin = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                     {"success": True, "asset_ref": "assets/h.png"})
+    assert fin["task"]["claimed_by"] is None
+    assert fin["task"]["asset_ref"] == "assets/h.png"
+    late = srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat", {})
+    assert late["status"] == 400
+
+
+def test_expired_lease_returns_task_to_queue(monkeypatch):
+    """A crashed renderer must never strand a task: expired lease -> queued."""
+    import poem.api as api
+
+    srv = make_server()
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+               {"worker_id": "gpu-dead", "lease_seconds": 1})
+    assert srv.handle("GET", "/api/v1/worlds/w1/images",
+                      {"status": "queued"})["pending"] == 1  # vignette only
+
+    # simulate the lease deadline passing (crashed worker, no heartbeat)
+    monkeypatch.setattr(api.time, "time", lambda: 1e12)
+    listed = srv.handle("GET", "/api/v1/worlds/w1/images")
+    hero_after = next(t for t in listed["tasks"] if t["id"] == hero["id"])
+    assert hero_after["status"] == "queued"
+    assert hero_after["claimed_by"] is None
+
+    # another live worker can now pick the orphaned job up
+    retry = srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+                       {"worker_id": "gpu-renderer-2"})
+    assert retry["task"]["status"] == "running"
+    assert retry["task"]["claimed_by"] == "gpu-renderer-2"
