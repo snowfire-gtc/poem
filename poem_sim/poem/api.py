@@ -11,7 +11,11 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import mimetypes
+import os
+import re
+import secrets
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -41,6 +45,54 @@ from .turn import ACCEPTED_NOTICE, DEFERRED_NOTICE, TurnEngine
 # Local GPU renderers renew this lease while a diffusion job runs; expired
 # leases (crashed worker) release the task back to the queue (§13 step 20).
 IMAGE_LEASE_SECONDS_DEFAULT = 600.0
+
+# ---------------------------------------------------------------------------
+# Server administration authentication (§15 security addendum)
+# ---------------------------------------------------------------------------
+# Mutating world-administration routes — everything that changes laws, wars,
+# treaties, turns or civilization setup — require an admin credential. The
+# credential is compared in constant time (hmac.compare_digest) so neither a
+# wrong length nor a wrong prefix leaks through response timing.
+ADMIN_TOKEN_ENV = "POEM_ADMIN_TOKEN"
+WORKER_TOKEN_ENV = "POEM_IMAGE_WORKER_TOKEN"
+AUTH_HEADER = "X-Auth-Token"
+ADMIN_SCHEME = "Bearer "
+
+
+def generate_admin_token() -> str:
+    """Mint a cryptographically strong admin token (URL-safe, 256 bits)."""
+    return secrets.token_urlsafe(32)
+
+
+class AuthError(Exception):
+    """Authentication/authorization failure carrying an HTTP status code."""
+
+    def __init__(self, message: str, status: int = 401) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _extract_credential(headers: dict | None, body: dict) -> tuple[str | None, str | None]:
+    """Pull (admin_token, worker_token) out of request headers/body.
+
+    Accepted spellings (first hit wins):
+      * ``Authorization: Bearer <token>`` header,
+      * ``X-Auth-Token: <token>`` header,
+      * ``{"auth_token": ...}`` inside the JSON body (frameworks that only
+        forward method/path/body),
+      * ``{"worker_token": ...}`` / ``X-Worker-Token`` for GPU workers.
+    """
+    headers = {str(k).lower(): v for k, v in (headers or {}).items()}
+    admin = headers.get("x-auth-token") or headers.get("x-admin-token")
+    if not admin:
+        authz = headers.get("authorization", "")
+        if isinstance(authz, str) and authz.startswith(ADMIN_SCHEME):
+            admin = authz[len(ADMIN_SCHEME):].strip()
+    if not admin:
+        admin = body.get("auth_token") or body.get("admin_token")
+    worker = (headers.get("x-worker-token") or body.get("worker_token"))
+    return (str(admin) if admin else None,
+            str(worker) if worker else None)
 
 # Hard cap for one rendered illustration stored through the API (§20.4:
 # assets live on the server's own disk, never on external object storage).
@@ -124,10 +176,22 @@ class WorldServer:
         season: SeasonId | None = None,
         asset_dir: str | Path | None = None,
         validator=None,
+        admin_token: str | None = None,
+        worker_token: str | None = None,
     ) -> None:
         # ``validator`` (TASK-066): pluggable server-side neural layer for
         # law-text validation; defaults to the deterministic local heuristic.
         self.store = LawStore(validator=validator)
+        # Server administration credential (§15 security addendum). Read
+        # from POEM_ADMIN_TOKEN when not passed explicitly; empty/absent
+        # means "open server" (tests & local play only — startup helpers
+        # should refuse to serve mutating routes without it in production).
+        self.admin_token = admin_token if admin_token is not None \
+            else os.environ.get(ADMIN_TOKEN_ENV, "")
+        # Separate, weaker credential for GPU render workers so they can
+        # claim/heartbeat/complete image tasks without full admin rights.
+        self.worker_token = worker_token if worker_token is not None \
+            else os.environ.get(WORKER_TOKEN_ENV, "")
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
         if season is not None:
             # Setting-specific calendar (alien planet, §7.2): e.g. a world
@@ -182,21 +246,137 @@ class WorldServer:
         if civ.id in self.civilizations:
             raise ValueError(f"civilization {civ.id} already exists")
         self.add_civilization(civ)
+        # TASK-068: every new civilization gets its koine registered in the
+        # language tree immediately (before any turn runs), so settlements,
+        # pricing and reports can consult it right away.
+        self.engine.language.add_civilization(
+            civ, self.chronology.current_era, self.chronology.current_year)
         return {"civilization": {
             "id": civ.id, "name": civ.name, "progress": civ.progress,
             "active": civ.active, "population": civ.population,
+            "language_unity": round(civ.language_unity, 4),
         }}
+
+    # ================= settlements & language (TASK-068) ====================
+
+    def add_settlement(self, path: str, body: dict) -> dict:
+        """POST /api/v1/worlds/{id}/settlements — found or annex a seat.
+
+        A settlement is the carrier of local speech (§ language design):
+        terrain decides how isolated it is, infrastructure (roads/harbours)
+        decides how far the koine reaches.  Mountain/island foundations are
+        seeded with latent divergence — they may branch off into their own
+        dialect within a few turns unless the ruler builds roads.
+        """
+        from .core import Settlement, Terrain
+        civ_id = body.get("civilization_id") or body.get("civ_id")
+        if not civ_id:
+            raise ValueError("civilization_id (or civ_id) is required")
+        sid = body.get("id")
+        if not sid:
+            raise ValueError("settlement id is required")
+        if any(s.id == sid for s in self.engine.language.settlements):
+            raise ValueError(f"settlement {sid} already exists")
+        terrain_raw = body.get("terrain", "plain")
+        try:
+            terrain = Terrain(terrain_raw) if isinstance(terrain_raw, str) \
+                else terrain_raw
+        except ValueError:
+            raise ValueError(f"unknown terrain {terrain_raw!r}; "
+                             f"expected one of {[t.value for t in Terrain]}")
+        s = Settlement(
+            id=sid,
+            civilization_id=civ_id,
+            name=body.get("name", sid),
+            terrain=terrain,
+            pop=float(body.get("pop", 1000.0)),
+            infrastructure=min(max(float(body.get("infrastructure", 0.0)), 0.0), 1.0),
+        )
+        d = self.engine.language.add_settlement(
+            s, self.chronology.current_era, self.chronology.current_year)
+        return {"settlement": {
+            "id": s.id, "name": s.name, "civilization_id": s.civilization_id,
+            "terrain": s.terrain.value, "pop": s.pop,
+            "infrastructure": s.infrastructure,
+            "dialect_id": d.id, "divergence": round(d.divergence, 4),
+        }}
+
+    def get_settlements(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/settlements — list seats with their speech."""
+        out = []
+        for s in self.engine.language.settlements:
+            d = self.engine.language.dialect_of(s)
+            out.append({
+                "id": s.id, "name": s.name, "civilization_id": s.civilization_id,
+                "terrain": s.terrain.value, "pop": s.pop,
+                "infrastructure": round(s.infrastructure, 4),
+                "dialect_id": s.dialect_id,
+                "divergence": round(d.divergence, 4) if d else 0.0,
+            })
+        return {"settlements": out}
+
+    def get_language_census(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/language[/{civ_id}] — the dialect tree.
+
+        Without ``civ_id`` returns the census of every active civilization;
+        the projection matches ``LanguageState.census`` (unity, dialect list
+        with speaker counts, settlement assignments).
+        """
+        parts = [p for p in path.strip("/").split("/") if p]
+        civ_ids = ([parts[-1]] if "language" in parts
+                   and len(parts) > parts.index("language") + 1
+                   else list(self.civilizations))
+        result = {}
+        for cid in civ_ids:
+            cen = self.engine.language.census(cid)
+            if cen:
+                result[cid] = cen
+        return {"language": result}
 
     # ------------------------------------------------------------- handlers
 
-    def handle(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _check_admin(self, token: str | None) -> None:
+        """Constant-time admin credential check (raises AuthError)."""
+        expected = self.admin_token or ""
+        if not expected:
+            return                      # open server (tests / local play)
+        if not token:
+            raise AuthError("authentication required: provide an admin "
+                            f"token via '{AUTH_HEADER}' header or "
+                            "'Authorization: Bearer <token>'", status=401)
+        if not hmac.compare_digest(str(token), str(expected)):
+            raise AuthError("invalid admin credentials", status=403)
+
+    def _check_worker_or_admin(self, worker: str | None,
+                               admin: str | None) -> None:
+        """GPU render endpoints accept either the dedicated worker token
+        or the full admin token; anything else is rejected."""
+        if self.worker_token and worker and \
+                hmac.compare_digest(str(worker), str(self.worker_token)):
+            return
+        self._check_admin(admin)
+
+    def handle(self, method: str, path: str, body: dict | None = None,
+               headers: dict | None = None) -> dict:
         body = body or {}
         try:
-            handler = _match_route(method.upper(), _normalize_path(path))
+            norm = _normalize_path(path)
+            handler = _match_route(method.upper(), norm)
         except ValueError as exc:
             return {"status": 400, "error": str(exc)}
         if handler is None:
             return {"error": f"no route {method} {path}", "status": 404}
+        # §15 security addendum: mutating routes are world administration.
+        # Read-only GETs stay public so the game client can poll state.
+        if method.upper() in {"POST", "PUT", "DELETE", "PATCH"}:
+            admin_tok, worker_tok = _extract_credential(headers, body)
+            try:
+                if handler in _WORKER_ROUTES:
+                    self._check_worker_or_admin(worker_tok, admin_tok)
+                else:
+                    self._check_admin(admin_tok)
+            except AuthError as exc:
+                return {"status": exc.status, "error": str(exc)}
         try:
             result = handler(self, path, body)
             return {"status": 200, **result}
@@ -206,9 +386,18 @@ class WorldServer:
     # ================= drafts (§15.1) =====================================
 
     def create_draft(self, path: str, body: dict) -> dict:
+        # Accept both canonical field names and short aliases (civ_id/title/text)
+        # so thin clients can post human-friendly payloads.
+        civ = body.get("civilization_id") or body.get("civ_id")
+        text = body.get("raw_text") or body.get("text")
+        if not civ or not text:
+            raise ValueError("civilization_id (or civ_id) and raw_text (or text) are required")
+        title = body.get("title")
+        if title and f"about:{title}" not in text:
+            text = f"[{title}] {text}"
         draft = self.store.create_draft(
-            civilization_id=body["civilization_id"],
-            raw_text=body["raw_text"],
+            civilization_id=civ,
+            raw_text=text,
             target_law_id=body.get("target_law_id"),
             now=_parse_dt(body.get("now")),
         )
@@ -537,6 +726,11 @@ class WorldServer:
             transition_years=transition_years,
             urgent=urgent,
             active_laws=active_laws,
+            # TASK-068: same language term as snapshot pricing — preview and
+            # charge stay identical (both read the server-side dialect tree;
+            # no settlements => 0.0, classic formula preserved).
+            language_fragmentation=self.engine._language_fragmentation(
+                law.civilization_id),
         )
         return {
             "estimated_cost": cost,
@@ -1145,7 +1339,7 @@ def _path_id(path: str, collection: str) -> str:
 
 
 def _draft_json(d) -> dict:
-    return {
+    out = {
         "id": d.id,
         "civilization_id": d.civilization_id,
         "target_law_id": d.target_law_id,
@@ -1153,6 +1347,10 @@ def _draft_json(d) -> dict:
         "status": d.status.value,
         "updated_at": d.updated_at.isoformat(),
     }
+    # Echo back the human-friendly title if it was embedded as "[Title] ..."
+    if d.raw_text and d.raw_text.startswith("[") and "]" in d.raw_text:
+        out["title"] = d.raw_text[1:d.raw_text.index("]")]
+    return out
 
 
 def _revision_json(r) -> dict:
@@ -1239,6 +1437,15 @@ _ROUTE_TABLE = [
 WorldServer._ROUTES = {
     (m, re.compile(p)): h for m, p, h in _ROUTE_TABLE
 }
+
+# GPU render-worker endpoints: these accept the dedicated (weaker) worker
+# token instead of full admin rights — a compromised renderer must not be
+# able to rewrite laws or run turns.
+_WORKER_ROUTES = frozenset({
+    WorldServer.claim_image_task,
+    WorldServer.heartbeat_image_task,
+    WorldServer.complete_image_task,
+})
 
 
 def _match_route(method: str, norm_path: str):

@@ -426,6 +426,90 @@ class IntervalEvent:
 
 
 # ---------------------------------------------------------------------------
+# Language & dialects (TASK-068) — one living language per civilization
+# ---------------------------------------------------------------------------
+
+
+class Terrain(enum.Enum):
+    """Settlement terrain. Connectivity of the land decides how far a
+    standard speech can travel: open ground carries it, mountains and marshes
+    swallow it, islands carry it by sea lanes (§ language design)."""
+
+    PLAIN = "plain"
+    HILLS = "hills"
+    MOUNTAIN = "mountain"
+    DESERT = "desert"
+    MARSH = "marsh"
+    ISLAND = "island"
+
+
+#: Base resistance of the land to the spread of common speech (0..1).
+TERRAIN_ISOLATION: dict[Terrain, float] = {
+    Terrain.PLAIN: 0.05,
+    Terrain.HILLS: 0.25,
+    Terrain.MOUNTAIN: 0.70,
+    Terrain.DESERT: 0.55,
+    Terrain.MARSH: 0.45,
+    Terrain.ISLAND: 0.35,
+}
+
+
+@dataclass
+class Settlement:
+    """A settlement of a civilization — carrier of its local speech.
+
+    ``infrastructure`` is the road/harbour level feeding the transport tech
+    (see poem.language.transport_tech_level); ``pop`` weights how much a
+    community counts in the language census.
+    """
+
+    id: str
+    civilization_id: CivilizationId
+    name: str = ""
+    terrain: Terrain = Terrain.PLAIN
+    pop: float = 1000.0
+    infrastructure: float = 0.0      # road/harbour level, grows over game time
+    dialect_id: str | None = None    # current local speech variety
+
+
+@dataclass
+class Dialect:
+    """One speech variety inside a civilization's language tree.
+
+    The capital's koine is the root; mountain/marsh/island communities split
+    off as children when isolation outruns unification for long enough.
+    All dynamics run in GAME time (§20.9); nothing here consults the
+    wall clock (§20.4).
+    """
+
+    id: str
+    civilization_id: CivilizationId
+    name: str
+    parent_id: str | None = None     # None => the koine (root of the tree)
+    divergence: float = 0.0          # distance from the koine, 0..1
+    created_year: float = 0.0        # world year of the split
+
+
+def mutual_intelligibility(a: Dialect | None, b: Dialect | None) -> float:
+    """Intelligibility between two varieties of ONE language, 0..1.
+
+    Same variety: fully understood. Two branches that forked at a common
+    ancestor are penalised by the sum of their post-fork drifts — the deeper
+    each side wandered since splitting, the harder the conversation. A child
+    is always better understood by its parent than two cousins by each other.
+    """
+    if a is None or b is None:
+        return 1.0
+    if a.id == b.id:
+        return 1.0
+    # Divergence is measured from the koine, so two varieties share speech up
+    # to their lesser drift; everything above it diverged after their fork.
+    # Cousins that wandered far apart are penalised by their difference too.
+    drift = abs(a.divergence - b.divergence) + min(a.divergence, b.divergence) * 0.5
+    return max(0.05, 1.0 - 0.9 * drift)
+
+
+# ---------------------------------------------------------------------------
 # Turn (§12)
 # ---------------------------------------------------------------------------
 
