@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
-poem_sim.egg-info/
+.venv/
+venv/
