@@ -116,6 +116,10 @@ class Civilization:
     # §11.3: how much one unit of research progress raises the development
     # index (progress, 0..1) that determines the world era (§9).
     research_to_progress: float = 1e-4
+    # TASK-068: language unification (0..1). 1.0 = the whole population uses
+    # the koine; low unity means dialect fragmentation and harder-to-enforce
+    # laws. Driven by poem.language each turn in GAME time only (§20.4).
+    language_unity: float = 0.9
 
 
 PROGRESS_ERA_THRESHOLDS: list[tuple[float, Era]] = [

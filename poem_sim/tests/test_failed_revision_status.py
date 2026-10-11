@@ -70,10 +70,11 @@ def build(broken=True):
     # there and nowhere else (snapshot preparation stays clean).
     orig_apply = engine._apply_snapshot_changes
 
-    def apply_once(snap, applied, failed=None):
+    def apply_once(snap, applied, failed=None, turn_id_of_application=None):
         store.fault_phase = True
         try:
-            orig_apply(snap, applied, failed)
+            orig_apply(snap, applied, failed,
+                       turn_id_of_application=turn_id_of_application)
         finally:
             store.fault_phase = False
 

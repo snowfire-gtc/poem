@@ -17,6 +17,12 @@ Design rules honoured here:
 * Reports are generated server-side per civilization and shipped inside the
   published turn report; the thin client displays them verbatim (principle
   1 of ui-client.md).
+* Optional LLM prose layer (poem.llm): when an LLM provider is configured,
+  template texts become *fallbacks* — each section's raw facts are handed
+  to the provider, which returns a fresh literary rewrite.  Prompts derive
+  from stable game data only, answers are cached by prompt hash, and any
+  provider failure degrades back to the deterministic template, so the
+  disabled path stays byte-identical to earlier revisions.
 
 The output structure::
 
@@ -108,6 +114,8 @@ _PEACE_VERSES = (
     "мир держится на чернилах — пусть будет крепче стали.",
     "Мы подписали тишину сроком на {years} зим и лет;\n"
     "пусть внуки нашают ей новую прочность, когда лопнет нить.",
+    "Послы {enemy} склонились над скатертью, и знамёна убрали в чехлы;\n"
+    "{civ} забирает с поля убитых, но не забывает павших.",
 )
 
 _RESEARCH_VERSES = (
@@ -205,10 +213,35 @@ def _section(kind, genre, title, text, refs=None):
             "text": text, "refs": refs or {}}
 
 
-def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
+def _build_sections(view: dict, civ_id: str, report: dict,
+                    llm=None) -> list[dict]:
+    """Compose the narrative chapters for one ruler.
+
+    ``llm`` — optional :class:`poem.llm.LlmTextProvider`.  When given and
+    enabled, each template text is offered to it as a deterministic fallback
+    alongside the section's raw facts; fresh LLM prose replaces the template,
+    failures keep it (§ poem.llm docstring).
+    """
     sections: list[dict] = []
     span_years = report.get("years_elapsed", 0)
     era_after = report.get("era_after", "")
+    if llm is None:
+        try:
+            from .llm import get_default_provider
+            candidate = get_default_provider()
+            llm = candidate if candidate.enabled else None
+        except Exception:
+            llm = None
+
+    def weave(kind: str, genre: str, title: str, fallback: str,
+              refs: dict, facts: dict) -> dict:
+        """One section: template text unless the LLM rewrites it."""
+        text = fallback
+        if llm is not None:
+            text = llm.generate(genre, kind, facts,
+                                civ_label=civ_label, fallback=fallback)
+        return _section(kind, genre, title, text, refs)
+
     civ_name = None
     for e in view.get("economy", []):
         if e.get("civilization_id") == civ_id:
@@ -248,19 +281,28 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
         foe = enemy_of(civ_id, parties)
         refs = {"war_id": wid, "civilization_id": civ_id}
         if active and fat >= 0.5:
-            text = pick(_WAR_LAMENTS, wid, "lament")
-            sections.append(_section(
-                "wars", "lament", "Плач по изнурённой земле",
-                text.format(years=_fmt_year(span_years), enemy=foe,
-                            place=foe, civ=civ_label),
-                refs))
+            fallback = pick(_WAR_LAMENTS, wid, "lament").format(
+                years=_fmt_year(span_years), enemy=foe, place=foe,
+                civ=civ_label)
+            sections.append(weave(
+                "wars", "lament", "Плач по изнурённой земле", fallback, refs,
+                {"war_id": wid, "years_elapsed": _fmt_year(span_years),
+                 "fatigue": round(fat, 2), "enemy": foe, "civ": civ_label}))
         elif active:
-            text = pick(_WAR_EPICS, wid, era_after)
-            sections.append(_section(
-                "wars", "epic", "Повесть о войне",
-                text.format(years=_fmt_year(span_years), enemy=foe,
-                            place=foe, civ=civ_label),
-                refs))
+            # Prefer an epic that actually names the foe; if none of the
+            # templates for this war contains {enemy}, force one that does
+            # (the report speaks from MY throne and must name the enemy).
+            idx = _h(wid, era_after) % len(_WAR_EPICS)
+            if "{enemy}" not in _WAR_EPICS[idx]:
+                idx = next(i for i, t in enumerate(_WAR_EPICS)
+                           if "{enemy}" in t)
+            fallback = _WAR_EPICS[idx].format(
+                years=_fmt_year(span_years), enemy=foe, place=foe,
+                civ=civ_label)
+            sections.append(weave(
+                "wars", "epic", "Повесть о войне", fallback, refs,
+                {"war_id": wid, "years_elapsed": _fmt_year(span_years),
+                 "fatigue": round(fat, 2), "enemy": foe, "civ": civ_label}))
 
     # --- peace treaties concluded this turn (ended wars) --------------------
     for t in view.get("diplomacy", []):
@@ -270,13 +312,18 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
             continue
         payload_refs = {"treaty_id": t.get("treaty_id")}
         ended = t.get("ended_war_id")
+        parties = war_parties.get(ended) or {}
+        foe = enemy_of(t.get("civilization_id"), parties)
         if ended:
             payload_refs["war_id"] = ended
-            text = pick(_PEACE_VERSES, ended, era_after)
-            sections.append(_section(
-                "peace", "lyric", "Слово о мире",
-                text.format(years=_fmt_year(t.get("remaining_years", 0))),
-                payload_refs))
+            fallback = pick(_PEACE_VERSES, ended, era_after).format(
+                years=_fmt_year(t.get("remaining_years", 0)),
+                enemy=foe, place=foe, civ=civ_label)
+            sections.append(weave(
+                "peace", "lyric", "Слово о мире", fallback, payload_refs,
+                {"war_id": ended, "treaty_id": t.get("treaty_id"),
+                 "peace_years": _fmt_year(t.get("remaining_years", 0)),
+                 "enemy": foe, "civ": civ_label}))
 
     # --- scientific & era breakthroughs -------------------------------------
     for e in view.get("economy", []):
@@ -284,11 +331,15 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
             continue
         research = float(e.get("research", 0.0))
         if research > 0:
-            text = pick(_RESEARCH_VERSES, civ_id, "research", era_after)
-            sections.append(_section(
-                "breakthroughs", "lyric", "О науке и ремесле",
-                text.format(years=_fmt_year(span_years), civ=civ_label),
-                {"civilization_id": civ_id}))
+            fallback = pick(_RESEARCH_VERSES, civ_id, "research",
+                            era_after).format(years=_fmt_year(span_years),
+                                              civ=civ_label)
+            sections.append(weave(
+                "breakthroughs", "lyric", "О науке и ремесле", fallback,
+                {"civilization_id": civ_id},
+                {"research_points": round(research, 2),
+                 "years_elapsed": _fmt_year(span_years),
+                 "era": era_after, "civ": civ_label}))
             break
 
     # economy-as-literature (granary ledger rendered as chronicle prose)
@@ -298,31 +349,38 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
         prod = float(e.get("production", 0.0))
         growth = float(e.get("population_growth", 0.0))
         if prod > 0 or growth > 0:
-            sections.append(_section(
-                "breakthroughs", "prose", "Летопись амбаров",
-                _ECONOMY_PROSE.format(years=_fmt_year(span_years),
-                                      prod=prod, pop=growth),
-                {"civilization_id": civ_id}))
+            fallback = _ECONOMY_PROSE.format(years=_fmt_year(span_years),
+                                             prod=prod, pop=growth)
+            sections.append(weave(
+                "breakthroughs", "prose", "Летопись амбаров", fallback,
+                {"civilization_id": civ_id},
+                {"years_elapsed": _fmt_year(span_years), "production": prod,
+                 "population_growth": growth, "civ": civ_label}))
         break
 
     if report.get("era_before") != report.get("era_after"):
-        text = pick(_ERA_CHANGE_VERSES, era_after, int(report.get(
-            "world_year_after", 0)))
-        sections.append(_section(
-            "breakthroughs", "lyric", "Граница эпох",
-            text.format(years=_fmt_year(span_years),
-                        era=_era_gen(era_after).lower()),
-            {}))
+        fallback = pick(_ERA_CHANGE_VERSES, era_after, int(report.get(
+            "world_year_after", 0))).format(
+            years=_fmt_year(span_years), era=_era_gen(era_after).lower())
+        sections.append(weave(
+            "breakthroughs", "lyric", "Граница эпох", fallback, {},
+            {"era_before": report.get("era_before"), "era_after": era_after,
+             "years_elapsed": _fmt_year(span_years),
+             "world_year": _fmt_year(report.get("world_year_after", 0)),
+             "civ": civ_label}))
 
     # --- geographical discoveries (envoy travels & arrivals) ----------------
     for ev in view.get("events", []):
         if ev.get("kind") == "TravelArrival":
-            text = pick(_TRAVEL_PROSE, ev.get("detail", ""),
-                        ev.get("year", 0))
-            sections.append(_section(
-                "discoveries", "prose", "Чужие земли",
-                text.format(years=_fmt_year(span_years), civ=civ_label),
-                {"event_kind": ev.get("kind")}))
+            fallback = pick(_TRAVEL_PROSE, ev.get("detail", ""),
+                            ev.get("year", 0)).format(
+                years=_fmt_year(span_years), civ=civ_label)
+            sections.append(weave(
+                "discoveries", "prose", "Чужие земли", fallback,
+                {"event_kind": ev.get("kind")},
+                {"detail": ev.get("detail", ""),
+                 "year": _fmt_year(ev.get("year", 0)),
+                 "years_elapsed": _fmt_year(span_years), "civ": civ_label}))
 
     # --- folk unrest: prejudices & high-mutation lore -----------------------
     for p in view.get("prejudices", []):
@@ -331,11 +389,14 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
         intensity = float(p.get("intensity", 0.0))
         resolved = bool(p.get("resolved"))
         if not resolved and intensity >= 0.3:
-            text = pick(_UNREST_WARNINGS, p.get("prejudice_id"),
-                        int(intensity * 10))
-            sections.append(_section(
-                "unrest", "warning", "Тревога в городе", text,
-                {"prejudice_id": p.get("prejudice_id")}))
+            fallback = pick(_UNREST_WARNINGS, p.get("prejudice_id"),
+                            int(intensity * 10))
+            sections.append(weave(
+                "unrest", "warning", "Тревога в городе", fallback,
+                {"prejudice_id": p.get("prejudice_id")},
+                {"prejudice_id": p.get("prejudice_id"),
+                 "intensity": round(intensity, 2),
+                 "topic": p.get("topic", ""), "civ": civ_label}))
 
     # --- folklore songs ------------------------------------------------------
     lore = {f["folklore_id"]: f for f in view.get("folklore", [])}
@@ -351,15 +412,21 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
         spread = float(m.get("spread", 0.0))
         title = meta.get("title", fid)
         if bool(meta.get("cancelled")):
-            text = _CANCELLED_MOTIF.format(item=title)
-            sections.append(_section(
-                "folklore", "prose", "Отвергнутое сказание", text,
-                {"folklore_id": fid}))
+            fallback = _CANCELLED_MOTIF.format(item=title)
+            sections.append(weave(
+                "folklore", "prose", "Отвергнутое сказание", fallback,
+                {"folklore_id": fid},
+                {"folklore_id": fid, "title": title, "cancelled": True,
+                 "mutation": round(mutation, 2), "spread": round(spread, 2),
+                 "civ": civ_label}))
         elif spread >= 0.5 or mutation >= 0.5:
-            text = pick(_FOLK_SONGS, fid, title)
-            sections.append(_section(
-                "folklore", "lyric", "Голос улиц",
-                text.format(item=title), {"folklore_id": fid}))
+            fallback = pick(_FOLK_SONGS, fid, title).format(item=title)
+            sections.append(weave(
+                "folklore", "lyric", "Голос улиц", fallback,
+                {"folklore_id": fid},
+                {"folklore_id": fid, "title": title,
+                 "mutation": round(mutation, 2), "spread": round(spread, 2),
+                 "civ": civ_label}))
 
     # --- lawcraft ------------------------------------------------------------
     applied = set(report.get("applied_revisions", []))
@@ -377,21 +444,29 @@ def _build_sections(view: dict, civ_id: str, report: dict) -> list[dict]:
         refs = {"law_id": rev.get("law_id"), "revision_id": rid,
                 "civilization_id": cid}
         if action == "RepealLaw":
-            text = pick(_LAW_REPEAL_PROSE, title, rid)
+            fallback = pick(_LAW_REPEAL_PROSE, title, rid).format(law=title)
         elif action == "SuspendLaw":
-            text = _LAW_SUSPEND_PROSE.format(law=title)
+            fallback = _LAW_SUSPEND_PROSE.format(law=title)
         else:
-            text = pick(_LAW_AMEND_PROSE, title, rid).format(
+            fallback = pick(_LAW_AMEND_PROSE, title, rid).format(
                 years=_fmt_year(span_years), law=title)
-        sections.append(_section("laws", "prose", "Указы и чернила", text, refs))
+        law_facts = {"law_id": rev.get("law_id"), "revision_id": rid,
+                     "law_title": title, "action": action,
+                     "years_elapsed": _fmt_year(span_years),
+                     "civ": civ_label}
+        sections.append(weave("laws", "prose", "Указы и чернила",
+                              fallback, refs, law_facts))
         # entrenched laws read as heritage, not decrees
         tradition = float(law.get("tradition", 0.0))
         if tradition >= 0.5:
-            sections.append(_section(
-                "laws", "prose", "Корни закона",
-                _TRADITION_PROSE.format(law=title,
-                                         age=_fmt_year(law.get("age_years", 0))),
-                refs))
+            fallback = _TRADITION_PROSE.format(
+                law=title, age=_fmt_year(law.get("age_years", 0)))
+            sections.append(weave(
+                "laws", "prose", "Корни закона", fallback, refs,
+                {"law_id": rev.get("law_id"), "law_title": title,
+                 "tradition": round(tradition, 2),
+                 "age_years": _fmt_year(law.get("age_years", 0)),
+                 "civ": civ_label}))
 
     return sections
 
@@ -402,14 +477,19 @@ def _title_of(turn_number, current_year, era_value) -> str:
 
 
 def build_ruler_report(view: dict, report: dict, civilizations: list,
-                       folklore_meta: list) -> list[dict]:
+                       folklore_meta: list, llm=None) -> list[dict]:
     """Compose one literary report per civilization (§13 step 22).
 
     ``view``  — the published client view (dashboard/economy/wars/…),
     ``report``— raw published turn report (applied revisions, era bounds),
     ``civilizations`` — [{id,name,…}] registered in the world,
-    ``folklore_meta`` — [{folklore_id,civilization_id,title,cancelled}].
-    Pure function of these inputs: deterministic and time-of-day free.
+    ``folklore_meta`` — [{folklore_id,civilization_id,title,canceled}],
+    ``llm``   — optional :class:`poem.llm.LlmTextProvider`; when omitted the
+                process-wide provider is consulted (no-op unless LLM mode is
+                enabled via POEM_LLM_ENABLED).
+    Pure function of these inputs: deterministic and time-of-day free; with
+    an LLM provider the texts are model-written but still reproducible
+    through prompt-hash caching (see poem/llm.py).
     """
     d = view.get("dashboard", {})
     out = []
@@ -421,10 +501,21 @@ def build_ruler_report(view: dict, report: dict, civilizations: list,
         civ_id = civ.get("id") if isinstance(civ, dict) else getattr(civ, "id", None)
         if civ_id is None:
             continue
-        sections = _build_sections(enriched, civ_id, merged_report)
+        sections = _build_sections(enriched, civ_id, merged_report, llm=llm)
         if not sections:
+            quiet_fallback = _DEFAULT_VERSE
+            quiet_refs = {"civilization_id": civ_id}
+            quiet_text = quiet_fallback
+            if llm is not None:
+                quiet_text = llm.generate(
+                    "lyric", "folklore",
+                    {"quiet_interval": True, "turn": d.get("turn", 0),
+                     "world_year": _fmt_year(d.get("current_year", 0)),
+                     "era": d.get("era_value", ""),
+                     "civ": civ_id},
+                    civ_label=civ_id, fallback=quiet_fallback)
             sections = [_section("folklore", "lyric", "Тихий интервал",
-                                 _DEFAULT_VERSE, {})]
+                                 quiet_text, quiet_refs)]
         verse_lines = [s["text"] for s in sections if s["genre"] == "lyric"]
         hero = verse_lines[0] if verse_lines else _DEFAULT_VERSE
         out.append({

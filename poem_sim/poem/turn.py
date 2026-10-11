@@ -93,6 +93,8 @@ class TurnReport:
     diplomacy: list[dict] = field(default_factory=list)           # §13 step 16
     wars: dict[str, dict[str, float]] = field(default_factory=dict)  # §13 step 17
     admin_costs: dict[str, float] = field(default_factory=dict)   # §5, per civ
+    language: dict[str, dict] = field(default_factory=dict)       # TASK-068, per civ census
+    language_events: list[dict] = field(default_factory=list)     # splits/merges this turn
     notices: list[str] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)              # §19.1 chronicle
     expired_effect_details: list[dict] = field(default_factory=list)  # for events
@@ -126,6 +128,15 @@ class TurnEngine:
         # Wars (§13 step 17): conflicts measured in GAME time; fatigue scales
         # with the turn span, never with wall-clock time of day (§20.4).
         self.wars: list[War] = []
+        # TASK-068: language & dialect tree (koine drift/split/merge), driven
+        # once per turn in GAME time. Settlements register here; each civ's
+        # ``language_unity`` feeds law pricing and report stylisation.
+        from .language import LanguageState
+        self.language = LanguageState()
+        for civ in civilizations:
+            if civ.id not in self.language.civilizations:
+                self.language.add_civilization(civ, chronology.current_era,
+                                               chronology.current_year)
         # per-turn prejudice deltas (§13 step 15), keyed by prejudice id
         self._prejudice_delta: dict[str, float] = {}
         self.turns: list[Turn] = []
@@ -314,6 +325,13 @@ class TurnEngine:
                     # §5 «уровень бюрократии»: the civ's own active norm set
                     # (final config of this snapshot) strains administration.
                     active_laws=snap.active_laws,
+                    # TASK-068: decrees cost more where speech is fragmented —
+                    # every dialect that barely understands the koine adds
+                    # translators, scribes and doubting clerks to enforcement.
+                    # A world without settlements speaks one common tongue:
+                    # fragmentation stays 0 and prices match the classic
+                    # formula exactly (backward compatibility).
+                    language_fragmentation=self._language_fragmentation(civ_id),
                 )
             snapshots.append(snap)
 
@@ -339,13 +357,40 @@ class TurnEngine:
         turn.turn_span = span
 
         # Steps 7+12: apply confirmed revisions from the snapshot.
+        # §4.4 "picked up by the next turn": an already-applied revision must
+        # never be re-applied by a second run_turn() on the same open turn —
+        # otherwise its suspension/transition effect would get a duplicate
+        # provenance stamp and could complete inside its own birth turn.
+        pending_revs = [rev for snap in self._snapshot_list
+                        for rev in snap.pending_amendments + snap.pending_repeals
+                        if rev.status != LawRevisionStatus.APPLIED]
+        for rev in pending_revs:
+            rev.status = LawRevisionStatus.INCLUDED_IN_SIMULATION
         # Snapshot of pre-existing timed effect ids BEFORE application, so
         # effects created by this turn's laws are not ticked/expired now.
         self._pre_turn_effect_ids = {e.id for e in self.timed_effects}
         applied: list[str] = []
         failed: dict[str, str] = {}   # revision_id -> error (§3.4 Failed)
+        applied_set: set[str] = set()  # provenance set for _born_this_turn (§11.7)
         for snap in self._snapshot_list:
-            self._apply_snapshot_changes(snap, applied, failed)
+            self._apply_snapshot_changes(
+                snap, applied, failed, turn_id_of_application=turn.id)
+        for rid in applied:           # §3.4: applied revisions are final
+            self.store.get_revision(rid).status = LawRevisionStatus.APPLIED
+        applied_set = set(applied)
+
+        # §11.7: timed effects spawned by THIS turn's directives — either by
+        # law application just above or by the exhausted-war peace below —
+        # must not complete within the very turn that created them; they
+        # join the tick pool only on the next turn.  Provenance is keyed by
+        # the finalized turn id, so several run_turn() calls inside one open
+        # turn cannot confuse the guard (a plain "born this run" snapshot
+        # would wrongly exempt pre-existing treaties from ticking).
+        def _born_this_turn(e: TimedEffect) -> bool:
+            if e.payload.get("created_by_war_exhaustion") == turn.id:
+                return True
+            rid = e.payload.get("created_by_revision")
+            return rid is not None and rid in applied_set
 
         # Steps 8–10: time-scaled systems (§11.1–11.3).
         economy: dict[str, dict[str, float]] = {}
@@ -386,7 +431,8 @@ class TurnEngine:
         expired_details: list[dict] = []
         survivors: list[TimedEffect] = []
         for eff in self.timed_effects:
-            if eff.id in pre_turn_effects and eff.tick(span):
+            if (eff.id in pre_turn_effects or not _born_this_turn(eff)) \
+                    and eff.tick(span):
                 expired.append(eff.id)
                 # §19.1: keep enough detail to render the expiry as a
                 # chronicle entry (kind + human-readable subject).
@@ -406,6 +452,9 @@ class TurnEngine:
         # duration in GAME time (§11.6). Durations are stored in years, never
         # in turn counts; a 100-year treaty ticks down by the turn span each
         # turn and expires by game time (3 turns at 40 y/turn, 100 at 1 y/turn).
+        # Treaties concluded during THIS very turn (e.g. an exhausted war that
+        # sued for peace above) are reported too — they exist from now on,
+        # they are simply not ticked until the next turn's span (§11.7).
         diplomacy: list[dict] = []
         for eff in self.timed_effects:
             if isinstance(eff, Treaty) or eff.kind == TimedEffectKind.TREATY:
@@ -436,21 +485,42 @@ class TurnEngine:
         # ends and a peace treaty is concluded for 25 game-years — its clock
         # then runs in game time like every other duration (§11.6).
         wars: dict[str, dict[str, float]] = {}
+        war_parties: dict[str, dict[str, str | None]] = {
+            # §19.1 / ruler report: include finished wars too — a peace
+            # concluded THIS turn must still know who fought whom.
+            w.id: {"attacker_id": w.attacker_id, "defender_id": w.defender_id}
+            for w in self.wars
+        }
         for war in self.wars:
             if not war.active:
                 continue
             war.tick(span.years)
             if war.exhausted:
                 war.active = False
-                self.timed_effects.append(Treaty(
+                peace = Treaty(
                     id=str(uuid.uuid4()), world_id=self.world_id,
                     civilization_id=war.attacker_id,
                     kind=TimedEffectKind.TREATY,
                     remaining=SimDuration(years=25.0),
                     payload={"treaty_kind": "peace",
                              "ended_war_id": war.id,
-                             "other_party": war.defender_id},
-                ))
+                             "other_party": war.defender_id,
+                             # §11.7 provenance: concluded THIS turn, so it
+                             # must not be ticked/expired until next turn.
+                             "created_by_war_exhaustion": turn.id},
+                )
+                self.timed_effects.append(peace)
+                # The diplomacy section above was built BEFORE wars were
+                # resolved; a peace concluded on THIS turn must still reach
+                # the ruler report ("Слово о мире"), so append its entry now.
+                diplomacy.append({
+                    "treaty_id": peace.id,
+                    "kind": "peace",
+                    "civilization_id": peace.civilization_id,
+                    "remaining_years": max(peace.remaining.years, 0.0),
+                    "ended_war_id": war.id,
+                    "other_party": war.defender_id,
+                })
             wars[war.id] = {
                 "active": 1.0 if war.active else 0.0,
                 "fatigue_attacker": round(war.fatigue_attacker, 4),
@@ -511,6 +581,18 @@ class TurnEngine:
                    "resolved": 1.0 if p.resolved else 0.0}
             for p in self.prejudices
         }
+
+        # TASK-068 (§ language design): advance the koine/dialect tree.
+        # Drift, road growth and unification all scale with the turn's
+        # GAME-time span — a 40-year ancient turn reshapes speech far more
+        # than a 1-year modern one; wall-clock time never enters (§20.4).
+        lang_events = self.language.tick(span, era=self.chronology.current_era,
+                                         current_year=self.chronology.current_year)
+        language_census: dict[str, dict] = {}
+        for cid in self.civilizations:
+            cen = self.language.census(cid)
+            if cen:
+                language_census[cid] = cen
 
         # Mark included revisions as Applied (successful applications only).
         for rev_id in applied:
@@ -606,6 +688,8 @@ class TurnEngine:
             diplomacy=diplomacy,
             wars=wars,
             admin_costs=admin_costs,
+            language=language_census,
+            language_events=lang_events,
             notices=notices,
             expired_effect_details=expired_details,
         )
@@ -654,9 +738,7 @@ class TurnEngine:
                 "_revisions_meta": revisions_meta,
                 "_civ_names": {cid: (c.name or cid)
                                for cid, c in self.civilizations.items()},
-                "_war_parties": {w.id: {"attacker_id": w.attacker_id,
-                                        "defender_id": w.defender_id}
-                                 for w in self.wars},
+                "_war_parties": war_parties,
             },
             [{"id": cid, "name": c.name}
              for cid, c in self.civilizations.items() if c.active],
@@ -675,6 +757,19 @@ class TurnEngine:
         return report
 
     # ------------------------------------------------------------- internals
+
+    def _language_fragmentation(self, civ_id: str) -> float:
+        """TASK-068: how poorly decrees travel through one civilization.
+
+        0.0 when the civ owns no settlements (a bare abstract world keeps
+        the pre-TASK-068 price formula byte-identical); otherwise the share
+        of the population whose local speech barely understands the koine.
+        Pure function of game state — never of wall-clock time (§20.4).
+        """
+        if not any(s.civilization_id == civ_id
+                   for s in self.language.settlements):
+            return 0.0
+        return max(0.0, 1.0 - self.language.average_intelligibility_to_koine(civ_id))
 
     def _count_conflicts(
         self, law, snap: TurnLawSnapshot, civ_id: str, prospective=None,
@@ -768,6 +863,7 @@ class TurnEngine:
     def _apply_snapshot_changes(
         self, snap: TurnLawSnapshot, applied: list[str],
         failed: dict[str, str] | None = None,
+        turn_id_of_application: str | None = None,
     ) -> None:
         """Steps 7+12 of §13. A revision whose application raises is recorded
         in ``failed`` (§3.4 Failed) and never lands in ``applied`` — the turn
@@ -793,7 +889,8 @@ class TurnEngine:
                         civilization_id=law.civilization_id,
                         kind=TimedEffectKind.SUSPENSION,
                         remaining=SimDuration(years=years),
-                        payload={"law_id": law.id},
+                        payload={"law_id": law.id,
+                                 "created_by_revision": rev.id},
                     )
                     self.timed_effects.append(eff)
                     snap.suspended_laws.append(law.id)   # §4.3 snapshot field
@@ -811,13 +908,15 @@ class TurnEngine:
                             kind=TimedEffectKind.LAW_TRANSITION,
                             remaining=rev.canonical_change.transition,
                             payload={"law_id": law.id,
-                                     "final_status": LawStatus.ACTIVE.value},
+                                     "final_status": LawStatus.ACTIVE.value,
+                                     "created_by_revision": rev.id},
                         ))
                 case LawUserAction.CLARIFY_LAW:
                     law.raw_text = rev.raw_text
           except Exception as exc:      # §3.4 Failed — isolate this revision
             failed[rev.id] = str(exc)
             continue
+          rev.simulation_turn_id = turn_id_of_application
           applied.append(rev.id)
 
     def _on_effect_expired(self, eff: TimedEffect) -> None:

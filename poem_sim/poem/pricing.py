@@ -36,6 +36,10 @@ class PricingConfig:
     transition_cost_per_year: float = 0.5      # §5.2 transitional period
     urgent_action_cost: float = 5.0            # special-resource urgency,
                                                # NOT wall-clock related (§5.2)
+    language_fragmentation_unit_cost: float = 12.0  # TASK-068: per unit of
+                                               # (1 - avg intelligibility to
+                                               # the koine) — decrees need
+                                               # translators in dialect lands
 
     # NOTE: no late_edit_cost_multiplier / late_edit_delay_chance fields.
     # Any attempt to add a time-of-day dependent field should be rejected
@@ -64,6 +68,7 @@ def cost_of_law_change(
     transition_years: float = 0.0,
     urgent: bool = False,
     active_laws: "list | tuple | None" = None,
+    language_fragmentation: float = 0.0,
 ) -> float:
     """Compute the gameplay cost of a confirmed law edit.
 
@@ -89,7 +94,9 @@ def cost_of_law_change(
         + (bureaucracy_level + law.administrative_load + administrative_overload)
         * cfg.admin_overload_unit_cost                            # admin overload
         + transition_years * cfg.transition_cost_per_year         # transitional period
-    )
+        + max(0.0, language_fragmentation)
+        * cfg.language_fragmentation_unit_cost   # TASK-068: fragmented speech
+    )                                             # = pricier enforcement
     if urgent:
         # Urgency as an in-game action spending a special resource (§5.2),
         # never tied to real time of day.
