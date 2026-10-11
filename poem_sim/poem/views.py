@@ -261,35 +261,180 @@ def render_dashboard_text(view: dict) -> str:
     return "\n".join(lines)
 
 
-def queue_image_tasks(view: dict, world_id: str) -> list[ImageTask]:
+# ---------------------------------------------------------------------------
+# Visual identity tokens (TASK-067): server-RAM memory of faces/appearances
+# ---------------------------------------------------------------------------
+
+#: Era aesthetics folded into every prompt so renders stay stylistically
+#: coherent within an epoch. Pure display-layer data (like ERA_LABELS_RU):
+#: derived from game state only, never from wall-clock time (§20.4).
+ERA_STYLE_TOKENS: dict[str, str] = {
+    "dawn": "faded ochre cave-pigment frescoes, primitive stylized figures",
+    "ancient": "sun-baked mudbrick and limestone, black-figure vase painting",
+    "classical": "balanced marble colonnades, idealized profile portraits",
+    "medieval": "illuminated manuscript gold leaf, tall cloistered silhouettes",
+    "renaissance": "chiaroscuro oil glazes, anatomically precise faces",
+    "industrial": "soot-darkened brick, iron lattices, early monochrome photography",
+    "modern": "concrete functionalism, saturated poster palettes",
+    "atomic": "brutalist skyline, atomic-age optimism, halftone shading",
+    "information": "cool glass-and-steel glow, screen-lit faces",
+    "planetary": "regolith domes, low-gravity dust, starlit horizons",
+}
+
+
+def select_tokens_for_task(registry, task_payload: dict, view: dict,
+                           max_count: int = 6) -> list:
+    """Deterministically pick visual tokens conditioning one render (TASK-067).
+
+    Priority: event-kind tokens → era style token → civilization tokens →
+    law/folklore cross-linked tokens → name matches against the chronicle
+    text (historical persons mentioned in a milestone finally get *their*
+    face). Insertion order breaks ties, so two identical worlds enqueue
+    byte-identical prompts (§4.1); nothing here consults wall-clock time.
+
+    The hero illustration depicts the turn's chronicle scene itself, so it
+    is additionally conditioned by identities bound to the actors of applied
+    law revisions (``refs.law_id``) — faces stay consistent even when the
+    chronicle never spells the name out.
+    """
+    if registry is None or len(registry) == 0:
+        return []
+
+    d = view.get("dashboard", {})
+    civ_id = task_payload.get("civilization_id")
+    era = d.get("era_value")
+    picked: dict = {}
+
+    def add(tok) -> None:
+        if tok is not None and tok.id not in picked and len(picked) < max_count:
+            picked[tok.id] = tok
+
+    # 1. explicit event-kind link (e.g. scene template for a Repeal entry)
+    ev_kind = task_payload.get("event_kind")
+    if ev_kind:
+        for tok in registry.search(kind="event"):
+            if tok.refs.get("event_kind") == ev_kind:
+                add(tok)
+
+    # 2. era style token (painting-style consistency across the epoch)
+    for tok in registry.search(kind="style"):
+        if tok.refs.get("era") == era:
+            add(tok)
+
+    # 3. civilization-bound tokens (places, costumes, inventions of that civ)
+    if civ_id:
+        for tok in registry.all():
+            if tok.civilization_id == civ_id:
+                add(tok)
+
+    # 4. tokens cross-linked to laws / folklore present in this turn's view
+    law_ids = {l.get("id") for l in view.get("laws", [])}
+    folk_ids = {f.get("folklore_id") for f in view.get("folklore", [])}
+    for tok in registry.all():
+        refs = set(tok.refs.values())
+        if refs & law_ids or refs & folk_ids:
+            add(tok)
+
+    # 5. hero scene = this turn's chronicle: persons/props attached to a
+    # law whose revision was just applied condition the main illustration
+    if task_payload.get("kind") == "hero":
+        applied = set(view.get("applied_revisions", []))
+        for tok in registry.all():
+            if tok.refs.get("law_id") in applied:
+                add(tok)
+
+    # 6. names appearing verbatim in the chronicle lines of this turn
+    hay = " ".join(
+        _norm_name(f"{ev.get('title', '')} {ev.get('detail', '')}")
+        for ev in view.get("events", [])
+    )
+    if hay:
+        for tok in registry.all():
+            if tok.kind in ("person", "place", "creature", "invention", "painting") \
+                    and _norm_name(tok.name) and _norm_name(tok.name) in hay:
+                add(tok)
+    return list(picked.values())
+
+
+def _norm_name(text: str) -> str:
+    return " ".join(str(text).lower().replace("\u0451", "е").split())
+
+
+def enrich_prompt(prompt: str, task_payload: dict, view: dict,
+                  registry=None) -> tuple[str, list[str]]:
+    """Append visual-token descriptors + era style to a raw prompt (§13 st.20).
+
+    Returns the enriched prompt and the ordered list of token ids used; the
+    same ids are stored on the task payload so a renderer can fetch exact
+    conditioning (embeddings / reference images) via the API.
+    """
+    out = prompt
+    style = ERA_STYLE_TOKENS.get(view.get("dashboard", {}).get("era_value", ""))
+    if style:
+        out += f"; art style: {style}"
+    token_ids: list[str] = []
+    fragments: list[str] = []
+    for tok in select_tokens_for_task(registry, task_payload, view):
+        frag = registry.prompt_fragment(tok)
+        if frag and frag not in fragments:
+            fragments.append(frag)
+        token_ids.append(tok.id)
+    if fragments:
+        out += "; visual identity tokens: " + "; ".join(fragments)
+    return out, token_ids
+
+
+def queue_image_tasks(view: dict, world_id: str, registry=None) -> list[ImageTask]:
     """§13 step 20: create illustration tasks from the generated view.
 
     One hero image per turn (chronicle scene of the era/year) plus one
     smaller vignette per applied law revision, so the report reads like a
     medieval/ancient chronicle even when a whole generation passed (§19.1).
+
+    ``registry`` (TASK-067) is the world's visual-token memory held in
+    server RAM — faces of historical persons, appearances of inventions,
+    paintings, places. When supplied, each task's prompt is enriched with
+    deterministic token descriptors and ``payload["token_ids"]`` records
+    which identities condition the render, so recurring subjects keep the
+    same look across the chronicle.
     """
     d = view["dashboard"]
-    tasks: list[ImageTask] = [
-        ImageTask(
-            id=str(uuid.uuid4()),
-            world_id=world_id,
-            turn_id=str(d["turn"]),
-            prompt=(
-                f"Chronicle illustration: {_era_label(d['era_value'])} era, "
-                f"world year {d['current_year']:g}, turn {d['turn']}"
-            ),
-            created_at=time.time(),
-            payload={"kind": "hero", "era": d["era_value"],
-                     "year": d["current_year"]},
-        )
-    ]
+    hero_payload = {"kind": "hero", "era": d["era_value"],
+                    "year": d["current_year"]}
+    hero_prompt, hero_tokens = enrich_prompt(
+        f"Chronicle illustration: {_era_label(d['era_value'])} era, "
+        f"world year {d['current_year']:g}, turn {d['turn']}",
+        hero_payload, view, registry)
+    hero = ImageTask(
+        id=str(uuid.uuid4()),
+        world_id=world_id,
+        turn_id=str(d["turn"]),
+        prompt=hero_prompt,
+        created_at=time.time(),
+        payload=hero_payload,
+    )
+    if hero_tokens:
+        hero.payload["token_ids"] = hero_tokens
+    tasks: list[ImageTask] = [hero]
     for rev_id in view.get("applied_revisions", []):
-        tasks.append(ImageTask(
+        law = next((l for l in view.get("laws", []) if l.get("id") == rev_id), None)
+        civ_id = (law or {}).get("civilization_id")
+        title = (law or {}).get("title") or rev_id
+        payload = {"kind": "law_vignette", "revision_id": rev_id}
+        if civ_id:
+            payload["civilization_id"] = civ_id
+        prompt, token_ids = enrich_prompt(
+            f"Law change vignette for revision {rev_id}: «{title}»",
+            payload, view, registry)
+        task = ImageTask(
             id=str(uuid.uuid4()),
             world_id=world_id,
             turn_id=str(d["turn"]),
-            prompt=f"Law change vignette for revision {rev_id}",
+            prompt=prompt,
             created_at=time.time(),
-            payload={"kind": "law_vignette", "revision_id": rev_id},
-        ))
+            payload=payload,
+        )
+        if token_ids:
+            task.payload["token_ids"] = token_ids
+        tasks.append(task)
     return tasks

@@ -144,6 +144,12 @@ class TurnEngine:
         # queued -> running -> done/failed as renderers claim them; they are
         # kept until acknowledged so clients can poll progress (§16).
         self.image_queue: list = []
+        # TASK-067: visual identity memory in server RAM — faces of
+        # historical persons, appearances of inventions, paintings, places.
+        # queue_image_tasks consults it so recurring subjects keep the same
+        # look across chronicle illustrations (deterministic, game-time only).
+        from .tokens import TokenRegistry
+        self.tokens = TokenRegistry(world_id)
 
     # ------------------------------------------------------------------ turns
 
@@ -609,7 +615,7 @@ class TurnEngine:
         # report, then queue chronicle illustration tasks derived from them.
         report.view = build_turn_view(
             report, self.chronology, list(self.civilizations.values()))
-        tasks = queue_image_tasks(report.view, self.world_id)
+        tasks = queue_image_tasks(report.view, self.world_id, registry=self.tokens)
         # §13 step 20: keep the created tasks server-side so renderers can
         # claim/complete them and clients can poll progress via the API.
         self.image_queue.extend(tasks)
