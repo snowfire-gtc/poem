@@ -9,6 +9,8 @@ to renderers/clients.
 from __future__ import annotations
 
 import sys
+
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,7 +115,7 @@ def test_image_tasks_are_queued_and_progress_via_api():
     done = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
                       {"success": True, "asset_ref": "assets/turn1_hero.png"})
     assert done["task"]["status"] == "done"
-    assert done["task"]["payload"]["asset_ref"] == "assets/turn1_hero.png"
+    assert done["task"]["asset_ref"] == "assets/turn1_hero.png"
 
     failed = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete", {})
     assert failed["status"] == 400   # already finished
@@ -128,3 +130,223 @@ def test_unknown_image_task_is_rejected():
     srv = make_server()
     res = srv.handle("POST", "/api/v1/images/nope/claim", {})
     assert res["status"] == 400
+
+
+def _run_turn(srv):
+    """Open and cut one logical turn through the public HTTP routes (§16)."""
+    srv.handle("POST", "/api/v1/worlds/w1/turns/open", {
+        "started_at": DAY.isoformat(),
+        "simulation_cutoff_at": DAY.replace(hour=23).isoformat(),
+    })
+    res = srv.handle("POST", "/api/v1/worlds/w1/turns/run", {})
+    assert res["status"] == 200, res
+    return res
+
+
+def _queued_hero(srv):
+    tasks = srv.handle("GET", "/api/v1/worlds/w1/images")["tasks"]
+    return next(t for t in tasks if t["payload"]["kind"] == "hero")
+
+
+def test_image_claim_records_worker_lease():
+    """Local GPU workers hold an exclusive lease on a claimed task."""
+    srv = make_server()
+    # produce image tasks for turn 1
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    res = srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+                     {"worker_id": "gpu-renderer-1", "lease_seconds": 30})
+    task = res["task"]
+    assert task["status"] == "running"
+    assert task["claimed_by"] == "gpu-renderer-1"
+    assert task["lease_expires_at"] is not None
+
+    hb = srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat",
+                    {"lease_seconds": 60})
+    assert hb["status"] == 200
+    assert hb["task"]["lease_expires_at"] >= task["lease_expires_at"]
+
+    bad = srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat", {})
+    # heartbeat after completion is invalid; complete while running is ok
+    fin = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                     {"success": True, "asset_ref": "assets/h.png"})
+    assert fin["task"]["claimed_by"] is None
+    assert fin["task"]["asset_ref"] == "assets/h.png"
+    late = srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat", {})
+    assert late["status"] == 400
+
+
+def test_expired_lease_returns_task_to_queue(monkeypatch):
+    """A crashed renderer must never strand a task: expired lease -> queued."""
+    import poem.api as api
+
+    srv = make_server()
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+               {"worker_id": "gpu-dead", "lease_seconds": 1})
+    assert srv.handle("GET", "/api/v1/worlds/w1/images",
+                      {"status": "queued"})["pending"] == 1  # vignette only
+
+    # simulate the lease deadline passing (crashed worker, no heartbeat)
+    monkeypatch.setattr(api.time, "time", lambda: 1e12)
+    listed = srv.handle("GET", "/api/v1/worlds/w1/images")
+    hero_after = next(t for t in listed["tasks"] if t["id"] == hero["id"])
+    assert hero_after["status"] == "queued"
+    assert hero_after["claimed_by"] is None
+
+    # another live worker can now pick the orphaned job up
+    retry = srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+                       {"worker_id": "gpu-renderer-2"})
+    assert retry["task"]["status"] == "running"
+    assert retry["task"]["claimed_by"] == "gpu-renderer-2"
+
+
+# ---------------------------------------------------------------------------
+# §20.4 asset storage: local renderers upload bytes; server serves them back
+# ---------------------------------------------------------------------------
+
+def _hero_after_turn(tmp_path=None):
+    srv = WorldServer("w1", asset_dir=tmp_path) if tmp_path is not None else make_server()
+    if tmp_path is not None:
+        srv.add_civilization(Civilization(id="c1", name="Rivers", progress=0.25))
+        srv.handle("POST", "/api/v1/laws", {
+            "id": "law-tax", "civilization_id": "c1", "title": "Head tax",
+            "raw_text": "Every settlement pays.", "canonical": {"kind": "tax"},
+        })
+        _revision(srv, hour=9)
+        _run_turn(srv)
+    return srv, _queued_hero(srv)
+
+
+def test_complete_uploads_asset_bytes_and_get_serves_them(tmp_path):
+    """Inline base64 upload lands in the server-owned dir and is served back."""
+    import base64 as b64
+    srv, hero = _hero_after_turn(tmp_path)
+    png = b"\x89PNG\r\n\x1a\n" + b"fake-encoder-output"
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+               {"worker_id": "gpu-renderer-1"})
+    fin = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                     {"success": True, "asset_ref": "w1/t1/hero.png",
+                      "asset_base64": b64.b64encode(png).decode()})
+    assert fin["status"] == 200
+    assert fin["task"]["asset_ref"] == "w1/t1/hero.png"
+    assert fin["asset"]["bytes"] == len(png)
+    assert (tmp_path / "w1/t1/hero.png").read_bytes() == png
+
+    got = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
+    assert got["status"] == 200
+    assert b64.b64decode(got["asset"]["base64"]) == png
+    assert got["asset"]["media_type"] == "image/png"
+
+
+def test_asset_ref_traversal_is_rejected(tmp_path):
+    """A renderer cannot write outside the server's asset sandbox (§20.4)."""
+    import base64 as b64
+    srv, hero = _hero_after_turn(tmp_path)
+    payload = b64.b64encode(b"x" * 8).decode()
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim", {"worker_id": "w"})
+    bad = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                     {"success": True, "asset_ref": "../escape.png",
+                      "asset_base64": payload})
+    assert bad["status"] == 400
+    assert not (tmp_path.parent / "escape.png").exists()
+    # task stays running after a rejected completion — nothing was written
+    listed = srv.handle("GET", "/api/v1/worlds/w1/images")
+    t = next(x for x in listed["tasks"] if x["id"] == hero["id"])
+    assert t["status"] == "running"
+
+
+def test_asset_not_ready_until_done(tmp_path):
+    """GET asset on a queued task is a 400; failed tasks keep no asset."""
+    import base64 as b64
+    srv, hero = _hero_after_turn(tmp_path)
+    early = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
+    assert early["status"] == 400
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim", {"worker_id": "w"})
+    fail = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                      {"success": False, "error": "CUDA out of memory"})
+    assert fail["task"]["status"] == "failed"
+    assert fail["task"]["asset_ref"] is None
+    assert fail["task"]["payload"]["error"] == "CUDA out of memory"
+    after = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
+    assert after["status"] == 400
+
+
+# ---------------------------------------------------------------------------
+# §13 step 20: GET /api/v1/worlds/{id}/images/metrics — admin queue metrics
+# ---------------------------------------------------------------------------
+
+def test_image_metrics_reports_depth_and_worker_load(monkeypatch):
+    """Metrics endpoint aggregates queue state without mutating it."""
+    import poem.api as api
+
+    srv = make_server()
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    # enqueue stamps created_at; claims stamp started_at and count attempts
+    assert hero["created_at"] is not None
+
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 40.0)
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim", {"worker_id": "gpu-0"})
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat", {"lease_seconds": 60})
+
+    m = srv.handle("GET", "/api/v1/worlds/w1/images/metrics")
+    assert m["status"] == 200
+    assert m["counts"]["running"] >= 1
+    assert m["by_worker"] == {"gpu-0": 1}
+    assert m["active_workers"] == 1
+    assert m["avg_wait_seconds"] == pytest.approx(40.0, abs=0.5)
+    assert m["reclaimed_leases"] == 0
+    # read-only: the task is still running after metrics was queried
+    listed = srv.handle("GET", "/api/v1/worlds/w1/images")["tasks"]
+    assert next(t for t in listed if t["id"] == hero["id"])["status"] == "running"
+
+
+def test_image_metrics_counts_render_time_and_reclaims(monkeypatch):
+    """Finished tasks contribute render duration; reclaimed leases are counted."""
+    import poem.api as api
+
+    srv = make_server()
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    # first worker claims at +10 then crashes (lease of 5 s expires)
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 10.0)
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+               {"worker_id": "gpu-dead", "lease_seconds": 5})
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 100.0)
+    retry = srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+                       {"worker_id": "gpu-live"})
+    assert retry["task"]["attempts"] == 2          # one reclaim happened
+
+    # live renderer finishes at +160 -> render time measured from FIRST claim
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 160.0)
+    done = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                      {"success": False, "error": "CUDA out of memory"})
+    assert done["task"]["finished_at"] == pytest.approx(hero["created_at"] + 160.0)
+
+    m = srv.handle("GET", "/api/v1/worlds/w1/images/metrics")
+    assert m["reclaimed_leases"] == 1
+    assert m["counts"]["failed"] == 1
+    assert m["success_rate"] == 0.0
+    assert m["avg_render_seconds"] == pytest.approx(150.0, abs=0.5)
+    assert m["active_workers"] == 0
+
+
+def test_image_metrics_route_not_shadowed_by_generic_paths():
+    """/images/metrics must hit the metrics handler, never a 404/400."""
+    srv = make_server()
+    res = srv.handle("GET", "/api/v1/worlds/w1/images/metrics")
+    assert res["status"] == 200
+    assert set(res["counts"]) == {"queued", "running", "done", "failed"}

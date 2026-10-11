@@ -136,11 +136,23 @@ CREATE TABLE IF NOT EXISTS interval_events (
 -- claim and complete them. `turn_id` links the illustration to its published
 -- report; asset_ref is filled on completion. No real-world timing affects
 -- generation (§20.4).
+-- Renderer queue (§13 step 20). Images are produced ONLY on the server's
+-- own GPUs by local worker processes -- no external generation services.
 CREATE TABLE IF NOT EXISTS image_tasks (
     id UUID PRIMARY KEY,
     world_id UUID NOT NULL,
     turn_id TEXT NOT NULL,
     prompt TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
+    status TEXT NOT NULL DEFAULT 'queued',   -- queued | running | done | failed
+    claimed_by TEXT,                         -- worker id holding the lease
+    lease_expires_at TIMESTAMPTZ,            -- crashed workers release tasks
+    asset_ref TEXT,                          -- local path served by the server
+    created_at TIMESTAMPTZ,                  -- queueing time (queue metrics)
+    started_at TIMESTAMPTZ,                  -- first claim by a GPU renderer
+    finished_at TIMESTAMPTZ,                 -- done/failed verdict timestamp
+    attempts INT NOT NULL DEFAULT 0,         -- claims incl. reclaimed leases
     payload JSONB NOT NULL DEFAULT '{}'
 );
+
+CREATE INDEX IF NOT EXISTS idx_image_tasks_queued
+    ON image_tasks (status, world_id);

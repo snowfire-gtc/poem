@@ -8,8 +8,14 @@ turn engine (i.e. all state is server-side, §20 rule 1).
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import mimetypes
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .chronology import Civilization, WorldChronology
 from .core import (
@@ -31,6 +37,63 @@ from .core import (
 from .laws import LawStore
 from .pricing import cost_of_law_change
 from .turn import ACCEPTED_NOTICE, DEFERRED_NOTICE, TurnEngine
+
+# Local GPU renderers renew this lease while a diffusion job runs; expired
+# leases (crashed worker) release the task back to the queue (§13 step 20).
+IMAGE_LEASE_SECONDS_DEFAULT = 600.0
+
+# Hard cap for one rendered illustration stored through the API (§20.4:
+# assets live on the server's own disk, never on external object storage).
+ASSET_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
+
+
+def _store_asset_bytes(asset_dir: Path | None, asset_ref: str, data: bytes) -> dict:
+    """Persist a locally rendered image under ``asset_dir`` and return meta.
+
+    ``asset_ref`` is treated as a relative path inside the server-owned
+    asset directory: it is sanitised (no absolute paths, no "..", only
+    [A-Za-z0-9._/-]) so a renderer can never write outside the sandbox —
+    images come from the server's own GPUs, but the reference still passes
+    through HTTP and must be validated like any other client input (§20.4).
+    """
+    if asset_dir is None:
+        raise ValueError("asset storage is not configured for this world server")
+    ref = str(asset_ref).strip().lstrip("/")
+    if not ref or any(c in ref for c in "\\:*?\"<>|") or "\x00" in ref:
+        raise ValueError(f"invalid asset_ref: {asset_ref!r}")
+    parts = ref.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"invalid asset_ref: {asset_ref!r}")
+    root = Path(asset_dir).resolve()
+    target = (root / ref).resolve()
+    if not str(target).startswith(str(root) + "/"):
+        raise ValueError(f"asset_ref escapes the asset directory: {asset_ref!r}")
+    if len(data) == 0:
+        raise ValueError("empty asset payload")
+    if len(data) > ASSET_MAX_BYTES_DEFAULT:
+        raise ValueError(f"asset too large: {len(data)} bytes")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".part")
+    tmp.write_bytes(data)          # atomic-ish: readers never see half files
+    tmp.replace(target)
+    media_type = mimetypes.guess_type(ref)[0] or "application/octet-stream"
+    return {
+        "asset_ref": ref,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "media_type": media_type,
+    }
+
+
+def _expire_image_leases(queue: list) -> None:
+    """Return running tasks whose lease has expired back to ``queued``."""
+    now = time.time()
+    for t in queue:
+        if (t.status == "running" and t.lease_expires_at is not None
+                and t.lease_expires_at <= now):
+            t.status = "queued"
+            t.claimed_by = None
+            t.lease_expires_at = None
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -59,6 +122,7 @@ class WorldServer:
         game_speed: GameSpeed = GameSpeed.STANDARD,
         era_source: EraSource = EraSource.MEDIAN_ACTIVE_CIVILIZATIONS,
         season: SeasonId | None = None,
+        asset_dir: str | Path | None = None,
     ) -> None:
         self.store = LawStore()
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
@@ -68,6 +132,9 @@ class WorldServer:
             self.chronology.current_season = season
         self.civilizations: dict[str, Civilization] = {}
         self.timed_effects: list[TimedEffect] = []
+        # Server-owned directory for illustrations produced by local GPU
+        # renderers (§20.4: assets never leave the server's own storage).
+        self.asset_dir = Path(asset_dir) if asset_dir is not None else None
         # Published turn reports (§13 step 22); the client fetches the last one.
         self.published_reports: list[dict] = []
         self.engine = TurnEngine(
@@ -82,6 +149,40 @@ class WorldServer:
     def add_civilization(self, civ: Civilization) -> None:
         self.civilizations[civ.id] = civ
         self.engine.civilizations[civ.id] = civ
+
+    # ================= civilizations (setup / §9 era source) ================
+
+    def create_civilization(self, path: str, body: dict) -> dict:
+        """POST /api/v1/worlds/{id}/civilizations — register a civilization.
+
+        Civilizations drive era determination (§9): their ``progress``
+        decides the world era and therefore the Civilization-like turn
+        interval (§6.2). Without this route a purely HTTP client could not
+        populate the world at all (era sources like
+        ``weighted_average`` need population, research needs rates), so
+        setup must be reachable through the API too.
+        """
+        civ = Civilization(
+            id=body["id"],
+            name=body.get("name", ""),
+            progress=float(body.get("progress", 0.0)),
+            active=bool(body.get("active", True)),
+            population=float(body.get("population", 1000.0)),
+            annual_production_rate=float(body.get("annual_production_rate", 0.0)),
+            annual_growth_rate=float(body.get("annual_growth_rate", 0.005)),
+            annual_research_rate=float(body.get("annual_research_rate", 0.0)),
+            culture_modifier=float(body.get("culture_modifier", 1.0)),
+            technology_modifier=float(body.get("technology_modifier", 1.0)),
+            administrative_budget=float(body.get("administrative_budget", 0.0)),
+            research_to_progress=float(body.get("research_to_progress", 1e-4)),
+        )
+        if civ.id in self.civilizations:
+            raise ValueError(f"civilization {civ.id} already exists")
+        self.add_civilization(civ)
+        return {"civilization": {
+            "id": civ.id, "name": civ.name, "progress": civ.progress,
+            "active": civ.active, "population": civ.population,
+        }}
 
     # ------------------------------------------------------------- handlers
 
@@ -462,15 +563,19 @@ class WorldServer:
     # ================= chronology (§15.4) ===================================
 
     def get_chronology(self, path: str, body: dict) -> dict:
-        from .chronology import calculate_turn_span
+        from .chronology import calculate_turn_span, determine_world_era
 
         ch = self.chronology
-        next_span = calculate_turn_span(ch, list(self.civilizations.values()))
+        civs = list(self.civilizations.values())
+        next_span = calculate_turn_span(ch, civs)
         return {
             "current_turn": ch.current_turn,
             "current_year": ch.current_year,
             "current_season": ch.current_season.value,
-            "current_era": ch.current_era.value,
+            # Live era (§9): re-derived from the registered civilizations so
+            # that setup via POST .../civilizations is reflected immediately,
+            # even before the first turn advances chronology.
+            "current_era": determine_world_era(ch, civs).value,
             "next_turn_span": {
                 "years": next_span.years,
                 "seasons": next_span.seasons,
@@ -651,43 +756,197 @@ class WorldServer:
 
     def list_image_tasks(self, path: str, body: dict) -> dict:
         """GET /api/v1/worlds/{id}/images — poll illustration progress (§16)."""
+        _expire_image_leases(self.engine.image_queue)  # reclaim crashed workers
         status_filter = body.get("status")
         tasks = [t.to_json() for t in self.engine.image_queue]
         if status_filter:
             tasks = [t for t in tasks if t["status"] == status_filter]
         return {"tasks": tasks, "pending": sum(1 for t in tasks if t["status"] == "queued")}
 
+    def image_queue_metrics(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/images/metrics — queue depth & render stats.
+
+        Admin-panel view of the local GPU rendering pipeline (§13 step 20):
+        backlog per status, per-worker load, reclaim count (expired leases)
+        and average wall-clock wait/render times over finished tasks. All
+        numbers are derived from task timestamps recorded by claim/complete;
+        nothing here changes game state.
+        """
+        queue = self.engine.image_queue
+        _expire_image_leases(queue)
+        now = time.time()
+        counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+        by_worker: dict[str, int] = {}
+        waits: list[float] = []      # created_at -> started_at
+        renders: list[float] = []    # started_at -> finished_at
+        reclaimed = 0
+        oldest_queued_age = None
+        for t in queue:
+            counts[t.status] = counts.get(t.status, 0) + 1
+            if t.status == "running" and t.claimed_by:
+                by_worker[t.claimed_by] = by_worker.get(t.claimed_by, 0) + 1
+            if t.attempts > 1:
+                reclaimed += t.attempts - 1
+            if t.created_at is not None and t.started_at is not None:
+                waits.append(t.started_at - t.created_at)
+            if t.started_at is not None and t.finished_at is not None:
+                renders.append(t.finished_at - t.started_at)
+            if t.status == "queued" and t.created_at is not None:
+                age = now - t.created_at
+                if oldest_queued_age is None or age > oldest_queued_age:
+                    oldest_queued_age = age
+
+        def _avg(xs: list[float]) -> float | None:
+            return round(sum(xs) / len(xs), 3) if xs else None
+
+        return {
+            "counts": counts,
+            "backlog": counts["queued"],
+            "active_workers": len(by_worker),
+            "by_worker": by_worker,
+            "reclaimed_leases": reclaimed,
+            "oldest_queued_age_seconds": (
+                round(oldest_queued_age, 3) if oldest_queued_age is not None else None
+            ),
+            "avg_wait_seconds": _avg(waits),
+            "avg_render_seconds": _avg(renders),
+            "finished": {"done": counts["done"], "failed": counts["failed"]},
+            "success_rate": (
+                round(counts["done"] / (counts["done"] + counts["failed"]), 4)
+                if counts["done"] + counts["failed"] else None
+            ),
+        }
+
     def claim_image_task(self, path: str, body: dict) -> dict:
-        """POST /api/v1/images/{task_id}/claim — renderer takes one job.
+        """POST /api/v1/images/{task_id}/claim — local GPU worker takes one job.
 
         queued -> running; claiming an already-running/finished task is a
         no-op error so parallel renderers never double-process (§13 step 20).
+        Images are rendered exclusively on the server's own video cards by
+        trusted local workers — no external generation services (§20.4).
+        A lease (claimed_by/lease_expires_at) lets crashed workers be
+        detected: expired leases release the task back to the queue.
         """
         task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
         for t in self.engine.image_queue:
             if t.id == task_id:
                 if t.status != "queued":
                     raise ValueError(f"task {task_id} is not claimable (status={t.status})")
                 t.status = "running"
+                t.claimed_by = str(body.get("worker_id", "worker"))
+                # Timestamps feed the queue metrics endpoint (§13 step 20):
+                # created_at is set at enqueue; started_at marks first claim.
+                if t.created_at is None:
+                    t.created_at = time.time()
+                if t.started_at is None:
+                    t.started_at = time.time()
+                t.attempts += 1
+                t.lease_expires_at = time.time() + float(
+                    body.get("lease_seconds", IMAGE_LEASE_SECONDS_DEFAULT)
+                )
+                return {"task": t.to_json()}
+        raise ValueError(f"unknown image task: {task_id}")
+
+    def heartbeat_image_task(self, path: str, body: dict) -> dict:
+        """POST /api/v1/images/{task_id}/heartbeat — extend the lease.
+
+        Long renders (high-res diffusion on local VRAM) renew their lease so
+        the scheduler does not reclaim a task that is still progressing.
+        """
+        task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                if t.status != "running":
+                    raise ValueError(f"task {task_id} is not running (status={t.status})")
+                t.lease_expires_at = time.time() + float(
+                    body.get("lease_seconds", IMAGE_LEASE_SECONDS_DEFAULT)
+                )
                 return {"task": t.to_json()}
         raise ValueError(f"unknown image task: {task_id}")
 
     def complete_image_task(self, path: str, body: dict) -> dict:
-        """POST /api/v1/images/{task_id}/complete — renderer reports verdict.
+        """POST /api/v1/images/{task_id}/complete — worker reports verdict.
 
         running -> done | failed, with the produced asset reference stored on
-        the task payload for the published report (§13 steps 20–22).
+        the task for the published report (§13 steps 20–22).
+        ``asset_ref`` must point at storage served by this same server
+        (local disk / internal object store), never an external service.
+        A local renderer may also upload the finished bytes inline
+        (``asset_base64``): they are then written into the server-owned
+        ``asset_dir`` and the stored reference is replaced by the sanitised
+        relative path plus sha256/size metadata.
         """
         task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
         for t in self.engine.image_queue:
             if t.id == task_id:
                 if t.status != "running":
                     raise ValueError(f"task {task_id} must be claimed first (status={t.status})")
                 success = bool(body.get("success", True))
+                meta = None
+                if success and body.get("asset_base64") is not None:
+                    try:
+                        data = base64.b64decode(str(body["asset_base64"]), validate=True)
+                    except (binascii.Error, ValueError):
+                        raise ValueError("asset_base64 is not valid base64") from None
+                    ref = body.get("asset_ref") or f"{t.world_id}/{t.turn_id}/{t.id}.png"
+                    meta = _store_asset_bytes(self.asset_dir, ref, data)
+                    t.asset_ref = meta["asset_ref"]
+                elif body.get("asset_ref"):
+                    # Reference-only completion is allowed when the renderer
+                    # writes directly into a shared server-local volume; the
+                    # path still has to be well-formed and inside the sandbox.
+                    if self.asset_dir is not None:
+                        root = Path(self.asset_dir).resolve()
+                        probe = (root / str(body["asset_ref"]).lstrip("/")).resolve()
+                        if not str(probe).startswith(str(root) + "/"):
+                            raise ValueError("asset_ref escapes the asset directory")
+                    t.asset_ref = str(body["asset_ref"])
                 t.status = "done" if success else "failed"
-                if body.get("asset_ref"):
-                    t.payload["asset_ref"] = body["asset_ref"]
-                return {"task": t.to_json()}
+                t.finished_at = time.time()   # metrics: render duration (§13 st.20)
+                if not success:
+                    t.asset_ref = None
+                if body.get("error"):
+                    t.payload["error"] = str(body["error"])
+                t.claimed_by = None
+                t.lease_expires_at = None
+                out = {"task": t.to_json()}
+                if meta:
+                    out["asset"] = meta
+                return out
+        raise ValueError(f"unknown image task: {task_id}")
+
+    def get_image_asset(self, path: str, body: dict) -> dict:
+        """GET /api/v1/images/{task_id}/asset — serve a finished illustration.
+
+        The client receives the bytes straight from the server's own storage
+        (base64 payload + media type); nothing is proxied from third parties.
+        Only tasks in status ``done`` with a materialised file are served.
+        """
+        task_id = _path_id(path, "images")
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                if t.status != "done" or not t.asset_ref:
+                    raise ValueError(f"image {task_id} is not ready (status={t.status})")
+                if self.asset_dir is None:
+                    raise ValueError("asset storage is not configured for this world server")
+                root = Path(self.asset_dir).resolve()
+                target = (root / str(t.asset_ref)).resolve()
+                if not str(target).startswith(str(root) + "/") or not target.is_file():
+                    raise ValueError(f"asset file is missing for image {task_id}")
+                data = target.read_bytes()
+                return {
+                    "asset": {
+                        "asset_ref": t.asset_ref,
+                        "media_type": mimetypes.guess_type(str(target))[0]
+                                    or "application/octet-stream",
+                        "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "base64": base64.b64encode(data).decode("ascii"),
+                    }
+                }
         raise ValueError(f"unknown image task: {task_id}")
 
     _ROUTES: dict = {}
@@ -724,8 +983,8 @@ def _normalize_path(path: str) -> str:
 def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
-                 "wars", "status", "images", "claim", "complete",
-                 "civilizations", "cost_preview"}
+                 "wars", "status", "images", "claim", "complete", "heartbeat",
+                 "asset", "civilizations", "cost_preview", "metrics"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -822,6 +1081,9 @@ _ROUTE_TABLE = [
     # §4.3: снимок активных законов, который читает симуляция (инспектируется
     # клиентом; правки со статусом IncludedInSimulation уже вошли в него).
     ("GET", r"^/api/v1/laws/snapshot$", WorldServer.get_snapshot),
+    # Регистрация цивилизаций при настройке мира: без неё чисто HTTP-клиент
+    # не может populate мир (§9 — эпоха определяется по цивилизациям).
+    ("POST", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.create_civilization),
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),
@@ -835,8 +1097,15 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/wars$", WorldServer.declare_war),
     # §13 step 20: иллюстрации хроники — очередь задач на генерацию.
     ("GET", r"^/api/v1/worlds/\{id\}/images$", WorldServer.list_image_tasks),
+    # Метрики очереди рендеринга для админ-панели (глубина, загрузка GPU-
+    # воркеров, среднее время ожидания/рендера). Специфичный путь обязан
+    # стоять до всеобщего worlds/{id}/{rest}, иначе матчится последний.
+    ("GET", r"^/api/v1/worlds/\{id\}/images/metrics$", WorldServer.image_queue_metrics),
     ("POST", r"^/api/v1/images/\{id\}/claim$", WorldServer.claim_image_task),
+    ("POST", r"^/api/v1/images/\{id\}/heartbeat$", WorldServer.heartbeat_image_task),
     ("POST", r"^/api/v1/images/\{id\}/complete$", WorldServer.complete_image_task),
+    # Готовая иллюстрация раздаётся с собственного хранилища сервера (§20.4).
+    ("GET", r"^/api/v1/images/\{id\}/asset$", WorldServer.get_image_asset),
 ]
 
 WorldServer._ROUTES = {
