@@ -150,6 +150,9 @@ server = WorldServer("w1", game_speed="standard")
 
 # цивилизации мира (progress 0..1 определяет эпоху по chronology.toml)
 server.add_civilization(Civilization(id="c1", name="Ромашки", progress=0.25))
+# то же самое доступно по HTTP — POST /api/v1/worlds/w1/civilizations
+# (id, name, progress + опциональные экономические поля); после регистрации
+# GET /chronology сразу показывает новую эпоху и интервал следующего хода
 
 now = datetime.now(timezone.utc)
 
