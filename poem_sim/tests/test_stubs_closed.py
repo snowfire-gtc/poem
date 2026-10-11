@@ -9,6 +9,8 @@ to renderers/clients.
 from __future__ import annotations
 
 import sys
+
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -276,3 +278,75 @@ def test_asset_not_ready_until_done(tmp_path):
     assert fail["task"]["payload"]["error"] == "CUDA out of memory"
     after = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
     assert after["status"] == 400
+
+
+# ---------------------------------------------------------------------------
+# §13 step 20: GET /api/v1/worlds/{id}/images/metrics — admin queue metrics
+# ---------------------------------------------------------------------------
+
+def test_image_metrics_reports_depth_and_worker_load(monkeypatch):
+    """Metrics endpoint aggregates queue state without mutating it."""
+    import poem.api as api
+
+    srv = make_server()
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    # enqueue stamps created_at; claims stamp started_at and count attempts
+    assert hero["created_at"] is not None
+
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 40.0)
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim", {"worker_id": "gpu-0"})
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/heartbeat", {"lease_seconds": 60})
+
+    m = srv.handle("GET", "/api/v1/worlds/w1/images/metrics")
+    assert m["status"] == 200
+    assert m["counts"]["running"] >= 1
+    assert m["by_worker"] == {"gpu-0": 1}
+    assert m["active_workers"] == 1
+    assert m["avg_wait_seconds"] == pytest.approx(40.0, abs=0.5)
+    assert m["reclaimed_leases"] == 0
+    # read-only: the task is still running after metrics was queried
+    listed = srv.handle("GET", "/api/v1/worlds/w1/images")["tasks"]
+    assert next(t for t in listed if t["id"] == hero["id"])["status"] == "running"
+
+
+def test_image_metrics_counts_render_time_and_reclaims(monkeypatch):
+    """Finished tasks contribute render duration; reclaimed leases are counted."""
+    import poem.api as api
+
+    srv = make_server()
+    _revision(srv, hour=9)
+    _run_turn(srv)
+    hero = _queued_hero(srv)
+
+    # first worker claims at +10 then crashes (lease of 5 s expires)
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 10.0)
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+               {"worker_id": "gpu-dead", "lease_seconds": 5})
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 100.0)
+    retry = srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+                       {"worker_id": "gpu-live"})
+    assert retry["task"]["attempts"] == 2          # one reclaim happened
+
+    # live renderer finishes at +160 -> render time measured from FIRST claim
+    monkeypatch.setattr(api.time, "time", lambda: hero["created_at"] + 160.0)
+    done = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                      {"success": False, "error": "CUDA out of memory"})
+    assert done["task"]["finished_at"] == pytest.approx(hero["created_at"] + 160.0)
+
+    m = srv.handle("GET", "/api/v1/worlds/w1/images/metrics")
+    assert m["reclaimed_leases"] == 1
+    assert m["counts"]["failed"] == 1
+    assert m["success_rate"] == 0.0
+    assert m["avg_render_seconds"] == pytest.approx(150.0, abs=0.5)
+    assert m["active_workers"] == 0
+
+
+def test_image_metrics_route_not_shadowed_by_generic_paths():
+    """/images/metrics must hit the metrics handler, never a 404/400."""
+    srv = make_server()
+    res = srv.handle("GET", "/api/v1/worlds/w1/images/metrics")
+    assert res["status"] == 200
+    assert set(res["counts"]) == {"queued", "running", "done", "failed"}

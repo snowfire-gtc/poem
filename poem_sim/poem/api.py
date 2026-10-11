@@ -763,6 +763,60 @@ class WorldServer:
             tasks = [t for t in tasks if t["status"] == status_filter]
         return {"tasks": tasks, "pending": sum(1 for t in tasks if t["status"] == "queued")}
 
+    def image_queue_metrics(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/images/metrics — queue depth & render stats.
+
+        Admin-panel view of the local GPU rendering pipeline (§13 step 20):
+        backlog per status, per-worker load, reclaim count (expired leases)
+        and average wall-clock wait/render times over finished tasks. All
+        numbers are derived from task timestamps recorded by claim/complete;
+        nothing here changes game state.
+        """
+        queue = self.engine.image_queue
+        _expire_image_leases(queue)
+        now = time.time()
+        counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+        by_worker: dict[str, int] = {}
+        waits: list[float] = []      # created_at -> started_at
+        renders: list[float] = []    # started_at -> finished_at
+        reclaimed = 0
+        oldest_queued_age = None
+        for t in queue:
+            counts[t.status] = counts.get(t.status, 0) + 1
+            if t.status == "running" and t.claimed_by:
+                by_worker[t.claimed_by] = by_worker.get(t.claimed_by, 0) + 1
+            if t.attempts > 1:
+                reclaimed += t.attempts - 1
+            if t.created_at is not None and t.started_at is not None:
+                waits.append(t.started_at - t.created_at)
+            if t.started_at is not None and t.finished_at is not None:
+                renders.append(t.finished_at - t.started_at)
+            if t.status == "queued" and t.created_at is not None:
+                age = now - t.created_at
+                if oldest_queued_age is None or age > oldest_queued_age:
+                    oldest_queued_age = age
+
+        def _avg(xs: list[float]) -> float | None:
+            return round(sum(xs) / len(xs), 3) if xs else None
+
+        return {
+            "counts": counts,
+            "backlog": counts["queued"],
+            "active_workers": len(by_worker),
+            "by_worker": by_worker,
+            "reclaimed_leases": reclaimed,
+            "oldest_queued_age_seconds": (
+                round(oldest_queued_age, 3) if oldest_queued_age is not None else None
+            ),
+            "avg_wait_seconds": _avg(waits),
+            "avg_render_seconds": _avg(renders),
+            "finished": {"done": counts["done"], "failed": counts["failed"]},
+            "success_rate": (
+                round(counts["done"] / (counts["done"] + counts["failed"]), 4)
+                if counts["done"] + counts["failed"] else None
+            ),
+        }
+
     def claim_image_task(self, path: str, body: dict) -> dict:
         """POST /api/v1/images/{task_id}/claim — local GPU worker takes one job.
 
@@ -781,6 +835,13 @@ class WorldServer:
                     raise ValueError(f"task {task_id} is not claimable (status={t.status})")
                 t.status = "running"
                 t.claimed_by = str(body.get("worker_id", "worker"))
+                # Timestamps feed the queue metrics endpoint (§13 step 20):
+                # created_at is set at enqueue; started_at marks first claim.
+                if t.created_at is None:
+                    t.created_at = time.time()
+                if t.started_at is None:
+                    t.started_at = time.time()
+                t.attempts += 1
                 t.lease_expires_at = time.time() + float(
                     body.get("lease_seconds", IMAGE_LEASE_SECONDS_DEFAULT)
                 )
@@ -844,6 +905,7 @@ class WorldServer:
                             raise ValueError("asset_ref escapes the asset directory")
                     t.asset_ref = str(body["asset_ref"])
                 t.status = "done" if success else "failed"
+                t.finished_at = time.time()   # metrics: render duration (§13 st.20)
                 if not success:
                     t.asset_ref = None
                 if body.get("error"):
@@ -922,7 +984,7 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "wars", "status", "images", "claim", "complete", "heartbeat",
-                 "asset", "civilizations", "cost_preview"}
+                 "asset", "civilizations", "cost_preview", "metrics"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -1035,6 +1097,10 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/wars$", WorldServer.declare_war),
     # §13 step 20: иллюстрации хроники — очередь задач на генерацию.
     ("GET", r"^/api/v1/worlds/\{id\}/images$", WorldServer.list_image_tasks),
+    # Метрики очереди рендеринга для админ-панели (глубина, загрузка GPU-
+    # воркеров, среднее время ожидания/рендера). Специфичный путь обязан
+    # стоять до всеобщего worlds/{id}/{rest}, иначе матчится последний.
+    ("GET", r"^/api/v1/worlds/\{id\}/images/metrics$", WorldServer.image_queue_metrics),
     ("POST", r"^/api/v1/images/\{id\}/claim$", WorldServer.claim_image_task),
     ("POST", r"^/api/v1/images/\{id\}/heartbeat$", WorldServer.heartbeat_image_task),
     ("POST", r"^/api/v1/images/\{id\}/complete$", WorldServer.complete_image_task),

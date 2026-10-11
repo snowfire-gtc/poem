@@ -106,7 +106,7 @@
     ├── config/
     │   └── chronology.toml конфигурация эпох, скоростей и источников эпохи
     ├── poem/              ядро симуляции (~3 500 строк)
-    └── tests/             12 файлов, 103 теста
+    └── tests/             12 файлов, 106 тестов
 ```
 
 ## Модули ядра
@@ -201,7 +201,7 @@ print(w.handle("POST", "/api/v1/worlds/w1/civilizations",
                {"id": "rome", "name": "Рим", "progress": 0.3}))
 EOF
 
-pytest -q          # 103 passed
+pytest -q          # 106 passed
 ```
 
 Для продактив-развёртывания: PostgreSQL 14+ (`schema.sql`), HTTP-обвязка поверх
@@ -223,7 +223,7 @@ NVIDIA GPU 12+ ГБ VRAM (CUDA 12.x) под SDXL; стек инференса с
 
 ## Тесты
 
-103 автотеста в 12 файлах (`poem_sim/tests/`), покрывают ключевые требования Rev 3:
+106 автотестов в 12 файлах (`poem_sim/tests/`), покрывают ключевые требования Rev 3:
 
 - `test_cutoff_and_time_of_day` — время суток не влияет; срез хода; перенос поздних правок;
 - `test_server_laws_and_api` — серверные черновики/ревизии, настройка мира по HTTP;

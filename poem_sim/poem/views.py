@@ -18,6 +18,7 @@ Design rules honoured here:
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -40,6 +41,10 @@ class ImageTask:
     claimed_by: str | None = None   # local GPU worker holding the lease
     lease_expires_at: float | None = None  # unix ts; None when not running
     asset_ref: str | None = None    # server-local path, filled on success
+    created_at: float | None = None  # unix ts of queueing (metrics, §13 st.20)
+    started_at: float | None = None  # unix ts of first claim by a renderer
+    finished_at: float | None = None  # unix ts of done/failed verdict
+    attempts: int = 0               # claims incl. reclaimed expired leases
     payload: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
@@ -52,6 +57,10 @@ class ImageTask:
             "claimed_by": self.claimed_by,
             "lease_expires_at": self.lease_expires_at,
             "asset_ref": self.asset_ref,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "attempts": self.attempts,
             "payload": self.payload,
         }
 
@@ -269,6 +278,7 @@ def queue_image_tasks(view: dict, world_id: str) -> list[ImageTask]:
                 f"Chronicle illustration: {_era_label(d['era_value'])} era, "
                 f"world year {d['current_year']:g}, turn {d['turn']}"
             ),
+            created_at=time.time(),
             payload={"kind": "hero", "era": d["era_value"],
                      "year": d["current_year"]},
         )
@@ -279,6 +289,7 @@ def queue_image_tasks(view: dict, world_id: str) -> list[ImageTask]:
             world_id=world_id,
             turn_id=str(d["turn"]),
             prompt=f"Law change vignette for revision {rev_id}",
+            created_at=time.time(),
             payload={"kind": "law_vignette", "revision_id": rev_id},
         ))
     return tasks
