@@ -202,3 +202,77 @@ def test_expired_lease_returns_task_to_queue(monkeypatch):
                        {"worker_id": "gpu-renderer-2"})
     assert retry["task"]["status"] == "running"
     assert retry["task"]["claimed_by"] == "gpu-renderer-2"
+
+
+# ---------------------------------------------------------------------------
+# §20.4 asset storage: local renderers upload bytes; server serves them back
+# ---------------------------------------------------------------------------
+
+def _hero_after_turn(tmp_path=None):
+    srv = WorldServer("w1", asset_dir=tmp_path) if tmp_path is not None else make_server()
+    if tmp_path is not None:
+        srv.add_civilization(Civilization(id="c1", name="Rivers", progress=0.25))
+        srv.handle("POST", "/api/v1/laws", {
+            "id": "law-tax", "civilization_id": "c1", "title": "Head tax",
+            "raw_text": "Every settlement pays.", "canonical": {"kind": "tax"},
+        })
+        _revision(srv, hour=9)
+        _run_turn(srv)
+    return srv, _queued_hero(srv)
+
+
+def test_complete_uploads_asset_bytes_and_get_serves_them(tmp_path):
+    """Inline base64 upload lands in the server-owned dir and is served back."""
+    import base64 as b64
+    srv, hero = _hero_after_turn(tmp_path)
+    png = b"\x89PNG\r\n\x1a\n" + b"fake-encoder-output"
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim",
+               {"worker_id": "gpu-renderer-1"})
+    fin = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                     {"success": True, "asset_ref": "w1/t1/hero.png",
+                      "asset_base64": b64.b64encode(png).decode()})
+    assert fin["status"] == 200
+    assert fin["task"]["asset_ref"] == "w1/t1/hero.png"
+    assert fin["asset"]["bytes"] == len(png)
+    assert (tmp_path / "w1/t1/hero.png").read_bytes() == png
+
+    got = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
+    assert got["status"] == 200
+    assert b64.b64decode(got["asset"]["base64"]) == png
+    assert got["asset"]["media_type"] == "image/png"
+
+
+def test_asset_ref_traversal_is_rejected(tmp_path):
+    """A renderer cannot write outside the server's asset sandbox (§20.4)."""
+    import base64 as b64
+    srv, hero = _hero_after_turn(tmp_path)
+    payload = b64.b64encode(b"x" * 8).decode()
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim", {"worker_id": "w"})
+    bad = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                     {"success": True, "asset_ref": "../escape.png",
+                      "asset_base64": payload})
+    assert bad["status"] == 400
+    assert not (tmp_path.parent / "escape.png").exists()
+    # task stays running after a rejected completion — nothing was written
+    listed = srv.handle("GET", "/api/v1/worlds/w1/images")
+    t = next(x for x in listed["tasks"] if x["id"] == hero["id"])
+    assert t["status"] == "running"
+
+
+def test_asset_not_ready_until_done(tmp_path):
+    """GET asset on a queued task is a 400; failed tasks keep no asset."""
+    import base64 as b64
+    srv, hero = _hero_after_turn(tmp_path)
+    early = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
+    assert early["status"] == 400
+
+    srv.handle("POST", f"/api/v1/images/{hero['id']}/claim", {"worker_id": "w"})
+    fail = srv.handle("POST", f"/api/v1/images/{hero['id']}/complete",
+                      {"success": False, "error": "CUDA out of memory"})
+    assert fail["task"]["status"] == "failed"
+    assert fail["task"]["asset_ref"] is None
+    assert fail["task"]["payload"]["error"] == "CUDA out of memory"
+    after = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
+    assert after["status"] == 400

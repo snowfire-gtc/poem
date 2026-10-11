@@ -8,9 +8,14 @@ turn engine (i.e. all state is server-side, §20 rule 1).
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import mimetypes
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .chronology import Civilization, WorldChronology
 from .core import (
@@ -36,6 +41,48 @@ from .turn import ACCEPTED_NOTICE, DEFERRED_NOTICE, TurnEngine
 # Local GPU renderers renew this lease while a diffusion job runs; expired
 # leases (crashed worker) release the task back to the queue (§13 step 20).
 IMAGE_LEASE_SECONDS_DEFAULT = 600.0
+
+# Hard cap for one rendered illustration stored through the API (§20.4:
+# assets live on the server's own disk, never on external object storage).
+ASSET_MAX_BYTES_DEFAULT = 32 * 1024 * 1024
+
+
+def _store_asset_bytes(asset_dir: Path | None, asset_ref: str, data: bytes) -> dict:
+    """Persist a locally rendered image under ``asset_dir`` and return meta.
+
+    ``asset_ref`` is treated as a relative path inside the server-owned
+    asset directory: it is sanitised (no absolute paths, no "..", only
+    [A-Za-z0-9._/-]) so a renderer can never write outside the sandbox —
+    images come from the server's own GPUs, but the reference still passes
+    through HTTP and must be validated like any other client input (§20.4).
+    """
+    if asset_dir is None:
+        raise ValueError("asset storage is not configured for this world server")
+    ref = str(asset_ref).strip().lstrip("/")
+    if not ref or any(c in ref for c in "\\:*?\"<>|") or "\x00" in ref:
+        raise ValueError(f"invalid asset_ref: {asset_ref!r}")
+    parts = ref.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"invalid asset_ref: {asset_ref!r}")
+    root = Path(asset_dir).resolve()
+    target = (root / ref).resolve()
+    if not str(target).startswith(str(root) + "/"):
+        raise ValueError(f"asset_ref escapes the asset directory: {asset_ref!r}")
+    if len(data) == 0:
+        raise ValueError("empty asset payload")
+    if len(data) > ASSET_MAX_BYTES_DEFAULT:
+        raise ValueError(f"asset too large: {len(data)} bytes")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".part")
+    tmp.write_bytes(data)          # atomic-ish: readers never see half files
+    tmp.replace(target)
+    media_type = mimetypes.guess_type(ref)[0] or "application/octet-stream"
+    return {
+        "asset_ref": ref,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "media_type": media_type,
+    }
 
 
 def _expire_image_leases(queue: list) -> None:
@@ -75,6 +122,7 @@ class WorldServer:
         game_speed: GameSpeed = GameSpeed.STANDARD,
         era_source: EraSource = EraSource.MEDIAN_ACTIVE_CIVILIZATIONS,
         season: SeasonId | None = None,
+        asset_dir: str | Path | None = None,
     ) -> None:
         self.store = LawStore()
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
@@ -84,6 +132,9 @@ class WorldServer:
             self.chronology.current_season = season
         self.civilizations: dict[str, Civilization] = {}
         self.timed_effects: list[TimedEffect] = []
+        # Server-owned directory for illustrations produced by local GPU
+        # renderers (§20.4: assets never leave the server's own storage).
+        self.asset_dir = Path(asset_dir) if asset_dir is not None else None
         # Published turn reports (§13 step 22); the client fetches the last one.
         self.published_reports: list[dict] = []
         self.engine = TurnEngine(
@@ -758,9 +809,13 @@ class WorldServer:
         """POST /api/v1/images/{task_id}/complete — worker reports verdict.
 
         running -> done | failed, with the produced asset reference stored on
-        the task payload for the published report (§13 steps 20–22).
+        the task for the published report (§13 steps 20–22).
         ``asset_ref`` must point at storage served by this same server
         (local disk / internal object store), never an external service.
+        A local renderer may also upload the finished bytes inline
+        (``asset_base64``): they are then written into the server-owned
+        ``asset_dir`` and the stored reference is replaced by the sanitised
+        relative path plus sha256/size metadata.
         """
         task_id = _path_id(path, "images")
         _expire_image_leases(self.engine.image_queue)
@@ -769,12 +824,67 @@ class WorldServer:
                 if t.status != "running":
                     raise ValueError(f"task {task_id} must be claimed first (status={t.status})")
                 success = bool(body.get("success", True))
-                t.status = "done" if success else "failed"
-                if body.get("asset_ref"):
+                meta = None
+                if success and body.get("asset_base64") is not None:
+                    try:
+                        data = base64.b64decode(str(body["asset_base64"]), validate=True)
+                    except (binascii.Error, ValueError):
+                        raise ValueError("asset_base64 is not valid base64") from None
+                    ref = body.get("asset_ref") or f"{t.world_id}/{t.turn_id}/{t.id}.png"
+                    meta = _store_asset_bytes(self.asset_dir, ref, data)
+                    t.asset_ref = meta["asset_ref"]
+                elif body.get("asset_ref"):
+                    # Reference-only completion is allowed when the renderer
+                    # writes directly into a shared server-local volume; the
+                    # path still has to be well-formed and inside the sandbox.
+                    if self.asset_dir is not None:
+                        root = Path(self.asset_dir).resolve()
+                        probe = (root / str(body["asset_ref"]).lstrip("/")).resolve()
+                        if not str(probe).startswith(str(root) + "/"):
+                            raise ValueError("asset_ref escapes the asset directory")
                     t.asset_ref = str(body["asset_ref"])
+                t.status = "done" if success else "failed"
+                if not success:
+                    t.asset_ref = None
+                if body.get("error"):
+                    t.payload["error"] = str(body["error"])
                 t.claimed_by = None
                 t.lease_expires_at = None
-                return {"task": t.to_json()}
+                out = {"task": t.to_json()}
+                if meta:
+                    out["asset"] = meta
+                return out
+        raise ValueError(f"unknown image task: {task_id}")
+
+    def get_image_asset(self, path: str, body: dict) -> dict:
+        """GET /api/v1/images/{task_id}/asset — serve a finished illustration.
+
+        The client receives the bytes straight from the server's own storage
+        (base64 payload + media type); nothing is proxied from third parties.
+        Only tasks in status ``done`` with a materialised file are served.
+        """
+        task_id = _path_id(path, "images")
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                if t.status != "done" or not t.asset_ref:
+                    raise ValueError(f"image {task_id} is not ready (status={t.status})")
+                if self.asset_dir is None:
+                    raise ValueError("asset storage is not configured for this world server")
+                root = Path(self.asset_dir).resolve()
+                target = (root / str(t.asset_ref)).resolve()
+                if not str(target).startswith(str(root) + "/") or not target.is_file():
+                    raise ValueError(f"asset file is missing for image {task_id}")
+                data = target.read_bytes()
+                return {
+                    "asset": {
+                        "asset_ref": t.asset_ref,
+                        "media_type": mimetypes.guess_type(str(target))[0]
+                                    or "application/octet-stream",
+                        "bytes": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "base64": base64.b64encode(data).decode("ascii"),
+                    }
+                }
         raise ValueError(f"unknown image task: {task_id}")
 
     _ROUTES: dict = {}
@@ -812,7 +922,7 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "wars", "status", "images", "claim", "complete", "heartbeat",
-                 "civilizations", "cost_preview"}
+                 "asset", "civilizations", "cost_preview"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -928,6 +1038,8 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/images/\{id\}/claim$", WorldServer.claim_image_task),
     ("POST", r"^/api/v1/images/\{id\}/heartbeat$", WorldServer.heartbeat_image_task),
     ("POST", r"^/api/v1/images/\{id\}/complete$", WorldServer.complete_image_task),
+    # Готовая иллюстрация раздаётся с собственного хранилища сервера (§20.4).
+    ("GET", r"^/api/v1/images/\{id\}/asset$", WorldServer.get_image_asset),
 ]
 
 WorldServer._ROUTES = {
