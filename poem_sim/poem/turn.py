@@ -96,6 +96,7 @@ class TurnReport:
     notices: list[str] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)              # §19.1 chronicle
     expired_effect_details: list[dict] = field(default_factory=list)  # for events
+    ruler_reports: list[dict] = field(default_factory=list)  # §13 st.22 literary reports
     view: dict = field(default_factory=dict)                      # §13 step 19
     image_tasks: list[dict] = field(default_factory=list)         # §13 step 20
 
@@ -408,12 +409,19 @@ class TurnEngine:
         diplomacy: list[dict] = []
         for eff in self.timed_effects:
             if isinstance(eff, Treaty) or eff.kind == TimedEffectKind.TREATY:
-                diplomacy.append({
+                entry = {
                     "treaty_id": eff.id,
                     "kind": eff.payload.get("treaty_kind", "peace"),
                     "civilization_id": eff.civilization_id,
                     "remaining_years": max(eff.remaining.years, 0.0),
-                })
+                }
+                # §19.1 / ruler report: a peace that ended a war names the
+                # war and the other party so chronicles can tell them apart.
+                if eff.payload.get("ended_war_id"):
+                    entry["ended_war_id"] = eff.payload["ended_war_id"]
+                if eff.payload.get("other_party"):
+                    entry["other_party"] = eff.payload["other_party"]
+                diplomacy.append(entry)
             elif eff.kind == TimedEffectKind.TRAVEL:
                 diplomacy.append({
                     "travel_id": eff.id,
@@ -615,6 +623,49 @@ class TurnEngine:
         # report, then queue chronicle illustration tasks derived from them.
         report.view = build_turn_view(
             report, self.chronology, list(self.civilizations.values()))
+
+        # §13 step 22: wrap the published numbers into the ruler's literary
+        # turn report — wars, breakthroughs, discoveries, unrest, lawcraft —
+        # one per civilization, generated server-side and shown verbatim.
+        from .chronicle_report import build_ruler_report
+
+        revisions_meta = []
+        for snap in self._snapshot_list:
+            for rev in snap.pending_amendments + snap.pending_repeals:
+                revisions_meta.append({
+                    "revision_id": rev.id, "law_id": rev.law_id,
+                    "civilization_id": rev.civilization_id,
+                    "action": rev.action.value,
+                })
+        folklore_meta = [
+            {"folklore_id": item.id, "civilization_id": str(item.civilization_id),
+             "title": item.title,
+             "cancelled": bool(getattr(item, "cancelled", False))}
+            for item in self.folklore
+        ]
+        report.ruler_reports = build_ruler_report(
+            report.view,
+            {
+                "years_elapsed": report.years_elapsed,
+                "era_before": report.era_before.value,
+                "era_after": report.era_after.value,
+                "world_year_after": report.world_year_after,
+                "applied_revisions": report.applied_revisions,
+                "_revisions_meta": revisions_meta,
+                "_civ_names": {cid: (c.name or cid)
+                               for cid, c in self.civilizations.items()},
+                "_war_parties": {w.id: {"attacker_id": w.attacker_id,
+                                        "defender_id": w.defender_id}
+                                 for w in self.wars},
+            },
+            [{"id": cid, "name": c.name}
+             for cid, c in self.civilizations.items() if c.active],
+            folklore_meta,
+        )
+        # The literary reports belong to the published client view as well:
+        # GET /turns/report ships `view` verbatim (thin client shows them).
+        report.view["ruler_reports"] = report.ruler_reports
+
         tasks = queue_image_tasks(report.view, self.world_id, registry=self.tokens)
         # §13 step 20: keep the created tasks server-side so renderers can
         # claim/complete them and clients can poll progress via the API.

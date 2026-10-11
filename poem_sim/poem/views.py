@@ -146,6 +146,7 @@ def build_turn_view(report, chronology, civilizations) -> dict:
         "superseded_revisions": report.superseded_revisions,
         "expired_effects": report.expired_effects,
         "events": getattr(report, "events", []),   # §19.1 chronicle
+        "ruler_reports": getattr(report, "ruler_reports", []),  # §13 st.22 literature
         "notices": list(report.notices),
     }
 

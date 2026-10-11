@@ -634,6 +634,7 @@ class WorldServer:
             "economy": report.economy,
             "notices": report.notices,
             "admin_costs": report.admin_costs,
+            "ruler_reports": report.ruler_reports,   # §13 st.22: literary turn report
             "view": report.view,
             "image_tasks": report.image_tasks,
         }
