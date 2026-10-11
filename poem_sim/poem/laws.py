@@ -47,7 +47,7 @@ class LawStoreError(Exception):
 class LawStore:
     """Authoritative server store for laws, drafts and revisions."""
 
-    def __init__(self) -> None:
+    def __init__(self, validator=None) -> None:
         self._laws: dict[str, Law] = {}
         self._drafts: dict[LawDraftId, LawDraft] = {}
         self._revisions: dict[LawRevisionId, LawRevision] = {}
@@ -55,6 +55,13 @@ class LawStore:
         self._seq_counters: dict[str, itertools.count] = {}
         # history of applied versions per law (for "version history" UI, §16.2)
         self._law_history: dict[str, list[LawRevisionId]] = {}
+        # TASK-066 (§3.3): the server-side neural layer that validates law
+        # texts. Injectable so production can swap in a GPU-backed model;
+        # defaults to the deterministic local heuristic validator.
+        if validator is None:
+            from .validation import DEFAULT_VALIDATOR
+            validator = DEFAULT_VALIDATOR
+        self.validator = validator
 
     # ------------------------------------------------------------------ laws
 
@@ -121,6 +128,27 @@ class LawStore:
         if status is not None:
             draft.status = status
         draft.updated_at = now or utcnow()
+        return draft
+
+    def validate_draft(self, draft_id: LawDraftId) -> LawDraft:
+        """Run the server-side neural layer over a draft's text (§3.3).
+
+        On success the produced canonical form is attached and the draft
+        becomes ``Validated``; on failure it becomes ``Invalid`` and STAYS
+        on the server so the player can keep editing it from any device
+        (guide_client.md: «черновик остаётся на сервере в статусе Invalid»).
+        The verdict depends only on the text — never on wall-clock time
+        (§2, TASK-060): identical input yields an identical result.
+        """
+        draft = self.get_draft(draft_id)
+        if draft.status in (DraftStatus.SUBMITTED, DraftStatus.DISCARDED):
+            raise LawStoreError(f"draft {draft_id} is {draft.status.value} and immutable")
+        result = self.validator.validate(draft.raw_text, draft.target_law_id)
+        if result.ok:
+            draft.canonical_draft = result.canonical
+            draft.status = DraftStatus.VALIDATED
+        else:
+            draft.status = DraftStatus.INVALID
         return draft
 
     def get_draft(self, draft_id: LawDraftId) -> LawDraft:

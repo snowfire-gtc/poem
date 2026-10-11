@@ -123,8 +123,11 @@ class WorldServer:
         era_source: EraSource = EraSource.MEDIAN_ACTIVE_CIVILIZATIONS,
         season: SeasonId | None = None,
         asset_dir: str | Path | None = None,
+        validator=None,
     ) -> None:
-        self.store = LawStore()
+        # ``validator`` (TASK-066): pluggable server-side neural layer for
+        # law-text validation; defaults to the deterministic local heuristic.
+        self.store = LawStore(validator=validator)
         self.chronology = WorldChronology(world_id, game_speed=game_speed, era_source=era_source)
         if season is not None:
             # Setting-specific calendar (alien planet, §7.2): e.g. a world
@@ -236,6 +239,21 @@ class WorldServer:
         draft_id = _path_id(path, "drafts")
         self.store.discard_draft(draft_id)
         return {"discarded": draft_id}
+
+    def validate_draft(self, path: str, body: dict) -> dict:
+        """POST /api/v1/laws/drafts/{id}/validate (§3.3, TASK-066).
+
+        Runs the server-side neural layer over the draft's raw text and
+        returns the verdict together with the updated draft. A failing
+        verdict leaves the draft on the server in status ``Invalid`` so it
+        stays editable from any device; the verdict never depends on the
+        time of day (§2).
+        """
+        draft_id = _path_id(path, "drafts")
+        draft = self.store.validate_draft(draft_id)
+        result = self.store.validator.validate(
+            draft.raw_text, draft.target_law_id)
+        return {"draft": _draft_json(draft), "validation": result.to_json()}
 
     # ================= revisions (§15.2) ===================================
 
@@ -645,7 +663,6 @@ class WorldServer:
         law_id = _path_id(path, "laws")
         law = self.store.get_law(law_id)
         civ_id = law.civilization_id
-
         # --- drafts attached to this law (§3.3) ---
         drafts = [
             _draft_json(d) for d in self.store.list_drafts(civ_id)
@@ -699,6 +716,10 @@ class WorldServer:
             for f in self.engine.folklore if f.topic == law_id
         ]
 
+        # --- visual identity tokens bound to this law (TASK-067) ---
+        law_tokens = [t.to_json() for t in self.engine.tokens.all()
+                      if law_id in set(t.refs.values())]
+
         return {
             "law": self._law_json(law),
             "drafts": drafts,
@@ -707,6 +728,7 @@ class WorldServer:
             "transitions": transitions,
             "conflicts": conflicts,
             "folklore_effects": folklore,
+            "visual_tokens": law_tokens,
         }
 
     def _law_json(self, l: Law) -> dict:
@@ -949,6 +971,96 @@ class WorldServer:
                 }
         raise ValueError(f"unknown image task: {task_id}")
 
+    # ================= visual identity tokens (TASK-067) ====================
+
+    def register_visual_token(self, path: str, body: dict) -> dict:
+        """POST /api/v1/worlds/{id}/tokens — store a face/appearance in RAM.
+
+        Historical persons, invention looks, paintings, places, costumes:
+        everything the local GPU renderers need to draw the *same* subject
+        twice. Registration is idempotent by (kind, name): re-registering
+        refines the existing entry instead of duplicating it, so lore stays
+        stable across devices and reconnects.
+        """
+        token = self.engine.tokens.register(body, now=time.time())
+        return {"token": token.to_json()}
+
+    def list_visual_tokens(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/tokens — registry listing / search.
+
+        Query fields in the JSON body: ``q`` (substring over names,
+        descriptors, tags), ``kind``, ``tag``, ``limit``. Deterministic
+        insertion order; no game state changes (§20.4).
+        """
+        hits = self.engine.tokens.search(
+            query=str(body.get("q", "")),
+            kind=body.get("kind"), tag=body.get("tag"),
+            limit=int(body.get("limit", 50)))
+        return {"tokens": [t.to_json() for t in hits], "count": len(hits)}
+
+    def get_visual_token(self, path: str, body: dict) -> dict:
+        """GET /api/v1/tokens/{id} — one token with its consistency context."""
+        token = self.engine.tokens.must_get(_path_id(path, "tokens"))
+        related = self.engine.tokens.related_to(token)
+        return {"token": token.to_json(),
+                "related": [t.to_json() for t in related]}
+
+    def update_visual_token(self, path: str, body: dict) -> dict:
+        """PUT /api/v1/tokens/{id} — refine an existing identity in place.
+
+        Field-wise merge (absent keys keep prior values); the id is taken
+        from the path, so the descriptor/embedding/reference image of e.g.
+        «Юлий Цезарь» can be corrected without spawning a second face.
+        ``name``/``kind`` are optional here — they are read off the stored
+        token when omitted.
+        """
+        token_id = _path_id(path, "tokens")
+        current = self.engine.tokens.must_get(token_id)
+        data = dict(body)
+        data["id"] = token_id
+        data.setdefault("name", current.name)
+        data.setdefault("kind", current.kind)
+        token = self.engine.tokens.register(data, now=time.time())
+        return {"token": token.to_json()}
+
+    def delete_visual_token(self, path: str, body: dict) -> dict:
+        """DELETE /api/v1/tokens/{id} — forget one identity."""
+        self.engine.tokens.remove(_path_id(path, "tokens"))
+        return {"deleted": _path_id(path, "tokens")}
+
+    def token_condition(self, path: str, body: dict) -> dict:
+        """GET /api/v1/tokens/{id}/condition — renderer conditioning payload.
+
+        Aggregates the token plus its related identities into the exact
+        bundle a local GPU worker needs: prompt fragments, server-local
+        reference images, embeddings, negative hints. Read-only (§20.4).
+        """
+        token = self.engine.tokens.must_get(_path_id(path, "tokens"))
+        ids = [token.id] + [t.id for t in self.engine.tokens.related_to(token)]
+        cond = self.engine.tokens.condition_for(ids)
+        cond["token_id"] = token.id
+        return {"condition": cond}
+
+    def task_condition(self, path: str, body: dict) -> dict:
+        """GET /api/v1/images/{id}/condition — full conditioning for one task.
+
+        Renderer entry point (§13 step 20): returns the task's stored
+        prompt, the token ids selected when it was enqueued and their
+        conditioning bundle, so illustrations of recurring subjects are
+        byte-consistent without the worker guessing anything.
+        """
+        task_id = _path_id(path, "images")
+        _expire_image_leases(self.engine.image_queue)
+        for t in self.engine.image_queue:
+            if t.id == task_id:
+                ids = list(t.payload.get("token_ids", []))
+                cond = self.engine.tokens.condition_for(ids)
+                cond["task_id"] = t.id
+                cond["prompt"] = t.prompt
+                cond["status"] = t.status
+                return {"condition": cond}
+        raise ValueError(f"unknown image task: {task_id}")
+
     _ROUTES: dict = {}
 
 
@@ -984,11 +1096,13 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     known_ids = {"laws", "drafts", "revisions", "worlds", "chronology", "pending",
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "wars", "status", "images", "claim", "complete", "heartbeat",
-                 "asset", "civilizations", "cost_preview", "metrics"}
+                 "asset", "civilizations", "cost_preview", "metrics", "validate",
+                 "tokens", "condition"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
-    return prev in {"laws", "drafts", "revisions", "worlds", "treaties", "images"}
+    return prev in {"laws", "drafts", "revisions", "worlds", "treaties", "images",
+                    "tokens"}
 
 
 def _parse_action(value: str) -> LawUserAction:
@@ -1069,6 +1183,8 @@ _ROUTE_TABLE = [
     ("GET", r"^/api/v1/laws/drafts$", WorldServer.get_drafts),
     ("GET", r"^/api/v1/laws/drafts/\{id\}$", WorldServer.get_drafts),
     ("DELETE", r"^/api/v1/laws/drafts/\{id\}$", WorldServer.delete_draft),
+    # §3.3/TASK-066: вердикт нейросетевого слоя над текстом черновика.
+    ("POST", r"^/api/v1/laws/drafts/\{id\}/validate$", WorldServer.validate_draft),
     ("POST", r"^/api/v1/laws/\{id\}/revisions$", WorldServer.create_revision),
     ("POST", r"^/api/v1/laws/\{id\}/cost_preview$", WorldServer.preview_cost),
     ("GET", r"^/api/v1/laws/\{id\}/revisions$", WorldServer.get_revisions),
@@ -1106,6 +1222,17 @@ _ROUTE_TABLE = [
     ("POST", r"^/api/v1/images/\{id\}/complete$", WorldServer.complete_image_task),
     # Готовая иллюстрация раздаётся с собственного хранилища сервера (§20.4).
     ("GET", r"^/api/v1/images/\{id\}/asset$", WorldServer.get_image_asset),
+    # TASK-067: память образов мира — лица исторических персонажей, облики
+    # изобретений, картины, локации. Реестр живёт в RAM сервера; условия
+    # генерации (prompt-фрагменты, референсы, эмбеддинги) читают воркеры.
+    ("POST", r"^/api/v1/worlds/\{id\}/tokens$", WorldServer.register_visual_token),
+    ("GET", r"^/api/v1/worlds/\{id\}/tokens$", WorldServer.list_visual_tokens),
+    ("GET", r"^/api/v1/tokens/\{id\}/condition$", WorldServer.token_condition),
+    ("GET", r"^/api/v1/tokens/\{id\}$", WorldServer.get_visual_token),
+    ("PUT", r"^/api/v1/tokens/\{id\}$", WorldServer.update_visual_token),
+    ("DELETE", r"^/api/v1/tokens/\{id\}$", WorldServer.delete_visual_token),
+    # Кондиционирование конкретной задачи очереди — что подмешать в рендер.
+    ("GET", r"^/api/v1/images/\{id\}/condition$", WorldServer.task_condition),
 ]
 
 WorldServer._ROUTES = {
