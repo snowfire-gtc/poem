@@ -226,7 +226,11 @@
                 overlay.remove();
                 location.hash = '#/drafts/' + res.draft.id;
               } catch (e) { err.textContent = e.message; }
-            } })));
+            },
+          }),
+        ),
+      ),
+    );
     document.body.appendChild(overlay);
     overlay.addEventListener('click', (ev) => { if (ev.target === overlay) overlay.remove(); });
   }
@@ -435,7 +439,11 @@
                 P.toast(res.notice, 'ok', 9000);
                 invalidateLaw(lawId);
               } catch (e) { err.textContent = e.message; }
-            } })));
+            },
+          }),
+        ),
+      ),
+    );
     document.body.appendChild(overlay);
     overlay.addEventListener('click', (ev) => { if (ev.target === overlay) overlay.remove(); });
   }
@@ -662,7 +670,7 @@
         h('div', { class: 'muted small', text: 'усталость наступавшей' }),
         h('div', { class: 'bar fatigue-a' }, h('i', { style: `width:${(w.fatigue_attacker || 0) * 100}%` })),
         h('div', { class: 'muted small', text: 'усталость оборонявшейся' }),
-        h('div', { class: 'bar fatigue-d' }, h('i', { style: `width:${(w.fatigue_defender || 0) * 100}%` })))));
+        h('div', { class: 'bar fatigue-d' }, h('i', { style: `width:${(w.fatigue_defender || 0) * 100}%` }))));
     }
 
     // Формы заключения (длительность — в игровых годах, §2.8).
@@ -684,7 +692,9 @@
               P.toast(`договор ${String(res.treaty_id).slice(0, 8)} на ${P.fmtYears(res.duration_years)}`, 'ok');
               refreshReport();
             } catch (e) { P.toastError(e); }
-          } }))));
+          } }),
+      ),
+    ));
 
     const warA = h('input', { type: 'text', placeholder: 'наступатель' });
     const warB = h('input', { type: 'text', placeholder: 'оборонитель' });

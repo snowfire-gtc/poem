@@ -20,6 +20,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from .chronology import Civilization, WorldChronology
 from .core import (
@@ -257,6 +258,20 @@ class WorldServer:
             "language_unity": round(civ.language_unity, 4),
         }}
 
+    def list_civilizations(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/civilizations — реестр цивилизаций мира.
+
+        Read-only projection of the setup registry, so a thin client can
+        populate its civilization selector without scraping law records
+        (design principle 1: the server owns the state, the client only
+        projects responses).
+        """
+        return {"civilizations": [
+            {"id": c.id, "name": c.name, "progress": c.progress,
+             "active": c.active, "population": c.population}
+            for c in self.civilizations.values()
+        ]}
+
     # ================= settlements & language (TASK-068) ====================
 
     def add_settlement(self, path: str, body: dict) -> dict:
@@ -358,7 +373,19 @@ class WorldServer:
 
     def handle(self, method: str, path: str, body: dict | None = None,
                headers: dict | None = None) -> dict:
-        body = body or {}
+        body = dict(body or {})
+        # Параметры строки запроса (?civilization_id=…, ?status=…) всегда
+        # извлекаются из URL — иначе они попадают и в _normalize_path,
+        # превращая /laws/drafts?... в несуществующий маршрут /laws/{id}.
+        # Для GET (тело отсутствует) query подмешивается в body; для
+        # мутаций тело авторитетно: query не перекрывает переданные поля.
+        split = urlsplit(path)
+        if split.query:
+            query = {k: v[-1] for k, v in parse_qs(split.query).items()}
+            if method.upper() == "GET":
+                for key, val in query.items():
+                    body.setdefault(key, val)
+            path = split.path or "/"
         try:
             norm = _normalize_path(path)
             handler = _match_route(method.upper(), norm)
@@ -928,7 +955,8 @@ class WorldServer:
 
     def _law_json(self, l: Law) -> dict:
         return {
-            "id": l.id, "title": l.title, "status": l.status.value,
+            "id": l.id, "civilization_id": l.civilization_id,
+            "title": l.title, "status": l.status.value,
             "tradition": l.tradition, "age_years": l.age_years,
             "raw_text": l.raw_text,
         }
@@ -1296,8 +1324,15 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
-    return prev in {"laws", "drafts", "revisions", "worlds", "treaties", "images",
-                    "tokens"}
+    # Special case: /laws/drafts is a collection route (like /laws), so the
+    # literal segment "drafts" sitting after "laws" must NOT collapse into
+    # {id}; only a real id after "drafts" (d42) collapses.
+    if token == "drafts" and prev == "laws":
+        return False
+    if prev in {"laws", "drafts", "revisions", "worlds", "treaties", "images",
+                "tokens"}:
+        return True
+    return False
 
 
 def _parse_action(value: str) -> LawUserAction:
@@ -1399,6 +1434,7 @@ _ROUTE_TABLE = [
     # Регистрация цивилизаций при настройке мира: без неё чисто HTTP-клиент
     # не может populate мир (§9 — эпоха определяется по цивилизациям).
     ("POST", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.create_civilization),
+    ("GET", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.list_civilizations),
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),
