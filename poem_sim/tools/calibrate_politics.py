@@ -157,14 +157,30 @@ def run_world(srv: WorldServer, turns: int) -> dict:
         # copy. NOTE: the previous formula divided only Fortune/Conspiracy/
         # resurfaced items — rare kinds — by the touched count, which made
         # the ratio exceed 1 and tripped the band warning (§22.10).
+        # BUGFIX (calibration run 2026-10-13): `hidden_audit["canonical_events"]`
+        # is the WHOLE chronicle of the turn (interval events included), while
+        # the chronicler only processes items appended after `canon_start`
+        # (turn.py step 19a). Counting the full list as the denominator made
+        # depth nearly insensitive to report.* constants (halving them moved
+        # the metric by 0.006 — impossible for a real share). The engine now
+        # exposes the exact split in narrative_distortion: "new_canonical" is
+        # every NEW item, "fields"/"suppressed_count" the touched/buried ones.
         nd = report.narrative_distortion or {}
-        canon_new = report.hidden_audit.get("canonical_events", [])
-        n_new = len(canon_new) if canon_new else len(report.events)
-        touched = len(nd.get("fields", []))
-        buried = nd.get("suppressed_count", 0)
+        if "new_canonical" in nd:
+            n_new = nd["new_canonical"]
+            touched = nd["touched_count"]
+            buried = nd["suppressed_count"]
+        else:                       # fallback for older reports / tests
+            canon_new = report.hidden_audit.get("canonical_events", [])
+            n_new = len(canon_new) if canon_new else len(report.events)
+            touched = len(nd.get("fields", []))
+            buried = nd.get("suppressed_count", 0)
         suppressed_total += buried
+        # item-weighted share of NEW political chronicle entries the court
+        # chronicler softened or buried this turn (§22.5/§22.10). Turns with
+        # no political news contribute nothing to either side of the ratio.
         distorted_items += min(n_new, touched + buried)
-        political_items += max(n_new, touched + buried)
+        political_items += n_new
         civ_a = srv.engine.civilizations["cA"]
         risk_trace.append((round(civ_a.stability_years, 2),
                            round(civ_a.risk_premium, 6)))

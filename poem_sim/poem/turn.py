@@ -929,6 +929,7 @@ class TurnEngine:
                 report.events.append(entry)
             for ev_json in report.conspiracies:
                 ce = dict(ev_json)
+                ce["kind"] = "ConspiracyEvent"  # _is_political() hook
                 ce["title"] = ("Свержение правителя" if
                                ce.get("outcome") == "ruler_overthrown"
                                else "Заговор раскрыт")
@@ -951,6 +952,12 @@ class TurnEngine:
             # split canonical / narrative copies: the CANONICAL chronicle
             # (admin/audit, hidden_audit) keeps every fact with its honest
             # title; the public `report.events` gets the court's version.
+            # CALIBRATION NOTE (§22.10, run 2026-10-13): only the items
+            # appended THIS turn (new_items) are political news — Fortune
+            # rolls, conspiracies, resurfaced truth. The chronicler must not
+            # touch the routine interval events (base_items), otherwise the
+            # distortion-depth metric saturates near 1 and stops responding
+            # to report.* constants. Canonical/admin copy stays complete.
             canonical_events = []
             for e in report.events:
                 ce = {k: v for k, v in e.items() if k != "_severity"}
@@ -959,7 +966,7 @@ class TurnEngine:
                 canonical_events.append(ce)
             new_items = [{k: v for k, v in e.items() if k != "_severity"}
                          for e in report.events[canon_start:]]
-            base_items = report.events[:canon_start]
+            base_items = [dict(e) for e in report.events[:canon_start]]
             # per-civ grievance average feeds the flattery bias (§22.5)
             avg_g = politics_out.get("avg_grievance", {})
             mean_g = (sum(avg_g.values()) / len(avg_g)) if avg_g else 0.0
@@ -978,7 +985,13 @@ class TurnEngine:
             report.narrative_distortion = {
                 "applied": audit_new.get("applied", False),
                 "fields": audit_new.get("fields", []),
+                "touched_count": len(audit_new.get("fields", [])),
                 "suppressed_count": len(audit_new.get("suppressed", [])),
+                # exact denominator for the §22.10 «distortion depth» metric:
+                # only items appended THIS turn (after canon_start) reach the
+                # chronicler; hidden_audit["canonical_events"] is the WHOLE
+                # turn chronicle and must not be used as the base (§22.5).
+                "new_canonical": len(new_items),
                 "bias": audit_new.get("bias", 0.0),
                 "censorship": audit_new.get("censorship", 0.0),
             }

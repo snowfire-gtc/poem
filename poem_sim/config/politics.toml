@@ -40,6 +40,10 @@ tax_load = 0.25
 prestige_display = 0.2
 
 [politics.report]        # §22.5 flattery / censorship / self_deception
-flattery_scale = 0.5
-censorship_level = 0.6
+# Calibrated 2026-10-13 via tools/calibrate_politics.py (8 worlds × 400 turns,
+# ~40.5k civ-years, ruler-style 0.6): the previous 0.5/0.6 produced depth
+# 0.71 on the old metric and 0.581 even after the metric fix — at the very
+# edge of the target band [0.05, 0.60] (§22.10). Halved to give headroom.
+flattery_scale = 0.25
+censorship_level = 0.3
 self_deception_gain = 0.004
