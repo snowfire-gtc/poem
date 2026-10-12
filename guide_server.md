@@ -88,6 +88,28 @@ HTTP-слой (`poem/api.py`) написан фреймворк-независи
 
 ## 4. Порядок установки
 
+### 4.0. Автоматизированный чек-лист требований и развёртывание (`deploy.sh` / `deploy.bat`)
+
+В корне репозитория лежат скрипты развёртывания сервера: **`deploy.sh`** (Linux/macOS) и **`deploy.bat`** (Windows). Оба сначала проверяют чек-лист аппаратных (§2) и программных (§3) требований, затем выполняют развёртывание (venv + `pip install -e ".[test]"` + проверка импорта пакета и загрузки `config/chronology.toml`).
+
+```bash
+# Linux
+./deploy.sh check                       # только чек-лист (профиль min — по умолчанию)
+./deploy.sh check --profile=prod        # строгий чек-лист продактива (CPU/RAM/диск/PostgreSQL/GPU)
+./deploy.sh deploy                      # чек-лист + развёртывание (прерывается при FAIL)
+./deploy.sh test                        # прогон pytest в развёрнутом .venv
+```
+
+```bat
+rem Windows (cmd.exe)
+deploy.bat check
+deploy.bat check /profile:prod
+deploy.bat deploy
+deploy.bat test
+```
+
+Пункты чек-листа помечаются `[PASS]` / `[WARN]` (опциональный слой не выполнен — GPU, PostgreSQL для не-prod) / `[FAIL]` (обязательное требование нарушено; скрипт возвращает код 1 и прерывает развёртывание, если не задан `--force` / `/force`). Пороги профилей соответствуют таблицам §2.1–2.2: `min` — 2 ядра / 4 ГБ RAM / 10 ГБ диска; `recommended` и `prod` — 4 ядра / 16 ГБ RAM / 50 ГБ диска; `prod` дополнительно требует PostgreSQL 14+ (`schema.sql` использует `UUID`/`JSONB`, п. 4.3). Опции: `--dir` / `/dir` (каталог `poem_sim`), `--python` / `/python` (интерпретатор), `--skip-gpu` / `/skip-gpu`.
+
 ### 4.1. Установка ядра и тестов (dev-режим)
 
 ```bash
