@@ -240,3 +240,19 @@ table.laws tr:hover td { background: var(--panel-2); }
 .login-hero { max-width: 520px; margin: 8vh auto; }
 .chip { display: inline-block; background: var(--panel-2); border: 1px solid var(--line);
         border-radius: 999px; padding: 2px 10px; font-size: 12px; margin: 2px 4px 2px 0; }
+
+/* ------------------------------ Карта (§2.11) ---------------------------- */
+.map-grid { display:flex; flex-direction:column; gap:2px; overflow-x:auto; }
+.map-row { display:flex; gap:2px; }
+.map-cell { width:64px; height:56px; border-radius:6px; padding:3px; font-size:10px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:2px; overflow:hidden; text-align:center; }
+.map-cell .glyph { font-size:15px; line-height:1; }
+.map-cell .place { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:60px; }
+.map-cell .epithet { color:var(--muted); font-style:italic; font-size:9px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:60px; }
+.map-cell.k-known { background:rgba(75,168,146,.18); border:1px solid rgba(75,168,146,.5); }
+.map-cell.k-dim   { background:rgba(201,138,45,.12); border:1px dashed rgba(201,138,45,.5); color:var(--muted); }
+.map-cell.unknown { background:rgba(120,120,140,.08); border:1px dotted var(--muted); color:var(--muted); }
+.legend.k-known { color:#4ba892; } .legend.k-dim { color:#c98a2d; } .legend.k-unknown { color:var(--muted); }
+.map-lore li { margin:4px 0; }
