@@ -32,6 +32,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -351,9 +352,19 @@ def test_succession_is_mechanical_and_survives_laws():
     # civilization and laws SURVIVE the overthrow (§22.10 mitigation)
     assert srv.civilizations["c1"].active
     assert srv.store.get_law("law-tax") is not None
-    # the fact reached the chronicle
+    # the fact reached the chronicle. The court chronicler may reword the
+    # title ("добровольное отречение", §22.5) but never bury an accomplished
+    # succession; `honest_title` preserves the canonical wording for the
+    # admin/audit copy and lets tests pin the fact regardless of narrative.
     events_json = json.dumps(srv.engine.last_report.events, ensure_ascii=False)
-    assert "Свержение правителя" in events_json
+    assert "ruler_overthrown" in events_json
+    entries = [e for e in srv.engine.last_report.events
+               if e.get("outcome") == "ruler_overthrown"]
+    assert len(entries) == 1
+    assert entries[0]["honest_title"] == "Свержение правителя"
+    canon = [e for e in srv.engine.last_report.hidden_audit["canonical_events"]
+             if e.get("outcome") == "ruler_overthrown"]
+    assert canon and canon[0]["title"] == "Свержение правителя"
 
 
 def test_player_has_no_heir_choice_api():
@@ -535,7 +546,6 @@ def test_flattery_distorts_narrative_not_canon():
     assert audit["applied"] is True
     titles = [e["title"] for e in distorted]
     assert any(t != "Неурожай" for t in titles)
-    assert all(e.get("narrative") for e in distorted)
     # …while the canonical input was never mutated
     assert json.dumps(events, sort_keys=True,
                       ensure_ascii=False) == canonical_before
@@ -543,10 +553,18 @@ def test_flattery_distorts_narrative_not_canon():
     bad = next(e for e in distorted if e["kind"] == "FortuneEvent") \
         if any(e["kind"] == "FortuneEvent" for e in distorted) else None
     if bad is not None:   # censorship may have dropped it entirely
+        assert bad.get("narrative")
         assert "придворный хронист" in bad["detail"] or \
             bad["title"] != "Неурожай"
     good = next(e for e in distorted if e["kind"] == "Breakthrough")
-    assert "ярче" in good["detail"]
+    # §22.5 calibration scope (run 2026-10-13): the court chronicler lies
+    # only about POLITICAL news (Fortune/conspiracy/resurfaced truth).
+    # Routine items pass through untouched — flattering mundane facts
+    # saturates the distortion-depth metric and makes report.* constants
+    # unresponsive (§22.10). The turn pipeline stamps `canonical: true`
+    # on every public item that survived the chronicler unmarked.
+    assert not good.get("narrative")
+    assert good["detail"] == "Построена новая дорога."
     # suppressed news is recorded for later resurfacing (§22.5)
     if audit["suppressed"]:
         assert all(ev["kind"] == "FortuneEvent" for ev in audit["suppressed"])
@@ -556,6 +574,84 @@ def test_flattery_distorts_narrative_not_canon():
     _, audit_l = distort_chronicle(list(events), liberal, 0.1, cfg.report)
     assert liberal.self_deception == 0.0
     assert audit_l["bias"] <= 0.0 or not audit_l["applied"]
+
+
+def test_conspiracy_news_is_political_and_adverse():
+    """§22.5: plots are bad news for the throne — a tyrant's court either
+    softens them or buries them; the canonical copy stays honest."""
+    cfg = PoliticsConfig(enabled=True)
+    plot = {"kind": "ConspiracyEvent", "conspiracy_id": "c-1",
+            "civilization_id": "cA", "instigator": "军 faction",
+            "outcome": "ruler_overthrown", "new_ruler": "Иринай",
+            "year": 42.0}
+    tyrant = RulerState(name="T", style=0.9)
+    params = SimpleNamespace(flattery_scale=cfg.report.flattery_scale,
+                             censorship_level=0.0,
+                             self_deception_gain=cfg.report.self_deception_gain)
+    distorted, audit = distort_chronicle([dict(plot)], tyrant, 0.3, params)
+    assert audit["applied"] is True
+    assert distorted[0].get("narrative") is True
+    assert distorted[0]["title"] != "Свержение правителя"
+    # §22.2.3 / §22.9-4 hard contract: an OVERTHROW is a fait accompli —
+    # the court may reword it ("добровольное отречение") but full
+    # censorship must never bury it from the chronicle…
+    censor_params = SimpleNamespace(**{**vars(params),
+                                       "censorship_level": 0.9})
+    distorted2, audit2 = distort_chronicle([dict(plot)], tyrant, 0.3,
+                                           censor_params)
+    assert distorted2 and distorted2[0]["outcome"] == "ruler_overthrown"
+    assert audit2["suppressed"] == []
+    # …while an EXPOSED plot (no succession happened) can be buried this
+    # turn and lands in the suppression queue for later resurfacing.
+    exposed = {"kind": "ConspiracyEvent", "conspiracy_id": "c-2",
+               "civilization_id": "cA", "instigator": "senate",
+               "outcome": "plot_discovered", "year": 43.0}
+    distorted2b, audit2b = distort_chronicle([dict(exposed)], tyrant, 0.3,
+                                             censor_params)
+    assert distorted2b == []
+    assert audit2b["suppressed"] == [exposed]
+    # routine (non-political) items are never suppressed and stay unlabeled
+    routine = {"kind": "EraChange", "title": "Наступает эпоха железа"}
+    distorted3, audit3 = distort_chronicle([routine], tyrant, 0.3,
+                                           censor_params)
+    assert distorted3 == [dict(routine)]
+    assert audit3["suppressed"] == []
+
+
+def test_overthrow_fact_reaches_public_chronicle_under_censorship():
+    """§22.9-4 end-to-end: with default config (tyrant style 0.9, base
+    censorship 0.3 ⇒ censor band 0.42 > slot(0)=0.0) the overthrow item
+    WOULD have been dropped by naive censorship. The public chronicle of
+    the very same turn must still carry the fact of the succession —
+    softened title allowed, absence is not (§22.2.3 fait accompli)."""
+    cfg = PoliticsConfig(enabled=True)     # defaults: report.censorship on
+    cfg.fortune.p_min = cfg.fortune.p_max = 0.0
+    cfg.conspiracy.threshold = 0.01
+    cfg.conspiracy.base_ignition_p = 0.95
+    cfg.conspiracy.success_mod_statecraft = 0.0
+    cfg.conspiracy.fresh_cruelty_protection = 0.0
+    srv = make_political_server(cfg=cfg, seed=3, n_civs=1)
+    civ = srv.civilizations["c1"]
+    civ.ruler = RulerState(name="Старый", style=0.9, ascended_year=0.0)
+    srv.engine.factions["c1"] = [
+        EliteFaction(id="c1:military", civilization_id="c1", name="military",
+                     power=0.6, loyalty=-0.9, ambition=0.9,
+                     ideology=Ideology.AUTHORITARIAN),
+    ]
+    run_turns(srv, 1)
+    rep = srv.engine.last_report
+    nd = rep.narrative_distortion
+    assert nd["applied"] is True and nd["censorship"] > 0.0
+    cons = rep.politics()["conspiracies"] if hasattr(rep, "politics") \
+        else rep.conspiracies
+    assert cons and cons[0]["outcome"] == "ruler_overthrown"
+    titles = [e.get("title", "") for e in rep.events]
+    # the fact is present in the PUBLIC narrative copy…
+    assert any("отреч" in t or "Свержение" in t for t in titles), titles
+    # …and honestly titled in the canonical admin copy
+    canon_titles = [e.get("title", "")
+                    for e in rep.hidden_audit["canonical_events"]]
+    assert "Свержение правителя" in canon_titles
 
 
 # ===========================================================================
