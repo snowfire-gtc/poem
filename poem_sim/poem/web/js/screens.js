@@ -110,6 +110,14 @@
           h('span', { class: 'year', text: String(Math.round(e.year)) }),
           h('b', { text: e.title }),
           h('span', { class: 'chip', text: e.kind }),
+          /* Rev 4 §22.5: метки слоя — «нарратив» (сказано хронистом: лесть,
+             умолчание) против «канона» (честные цифры). Канонический факт
+             переворота сквозь цензуру всё равно проступает (§22.9). */
+          (e.narrative
+            ? h('span', { class: 'badge b-narrative', title: 'сказано придворным хронистом — льстит или умалчивает', text: 'нарратив' })
+            : e.canonical
+              ? h('span', { class: 'badge b-canonical', title: 'канонические цифры всегда честны', text: 'канон' })
+              : null),
           h('div', { class: 'muted small', text: e.detail || '' })));
         // Нелинейные деления: древние ходы длинные, поздние короткие (§2.2).
         const frac = y1 > y0 ? (e.year - y0) / (y1 - y0) : 0;
@@ -754,6 +762,138 @@
     el.appendChild(grid);
   }
 
+  /* ================================ ДВОР (Rev 4) ========================== */
+  /* #/court — design.md §16.4 / ui-client.md: карточка правителя и «двор».
+     Клиент показывает ТОЛЬКО серверные проекции: полосы власти/стиля и
+     слова-позиции фракций (§22.8). Точных чисел лояльности/оби/амбиций и
+     сырых бросков Фортуны в этих ответах нет — и появиться им здесь неоткуда. */
+  const STYLE_BAND_LABELS = {
+    tyrannic: 'тиранический двор',
+    'hard-handed': 'твёрдая рука',
+    moderate: 'умеренный двор',
+    liberal: 'либеральный двор',
+  };
+  const POWER_BAND_HINTS = {
+    high: 'фракция сильна — с ней считаются',
+    medium: 'фракция заметна при дворе',
+    low: 'фракция пока незначительна',
+  };
+  const POSITION_HINTS = {
+    disaffected: 'недовольны — открыто молчат, но ропщут',
+    loyal: 'лояльны трону',
+    watchful: 'наблюдают за ходом событий',
+  };
+  const SATURATION_LABELS = {
+    open: 'ниша пуста', contested: 'ниша оспаривается', crowded: 'ниша переполнена',
+  };
+
+  function CourtScreen(el) {
+    const s = S();
+    const elitesData = s.elites || {};
+    const rulerData = s.ruler || {};
+    const marketsData = s.markets || {};
+    el.appendChild(h('h1', {}, '🏛 Двор'));
+
+    if (elitesData.politics_enabled === false && rulerData.politics_enabled === false) {
+      el.appendChild(h('div', { class: 'banner warn' },
+        'Политический слой в этом мире выключен (politics.enabled=false) — двора, элит и рынков сбыта нет.'));
+      return;
+    }
+
+    /* --- карточка правителя (полосы, не числа; §22.8) --- */
+    const r = rulerData.ruler;
+    if (r) {
+      el.appendChild(h('div', { class: 'card ruler-card' },
+        h('h2', { style: 'margin-top:0' }, `Правитель: ${r.name}`),
+        h('div', { class: 'kv' }, 'Характер правления:',
+          h('b', { text: STYLE_BAND_LABELS[r.style_band] || r.style_band || '—' })),
+        h('div', { class: 'kv' }, 'Гласность добродетелей:', h('b', String(r.public_virtues ?? '—'))),
+        h('div', { class: 'kv' }, 'Возвысился в году:', h('b', String(r.ascended_year ?? '—'))),
+        h('div', { class: 'kv' }, 'Оpora при возвышении:',
+          h('b', { text: r.origin_faction || '—' })),
+        h('div', { class: 'muted small' },
+          'Двор судят по намёкам: точных мерил характера летописи не хранят.')));
+    } else {
+      el.appendChild(h('div', { class: 'card' },
+        h('h2', { style: 'margin-top:0' }, 'Правитель'),
+        h('div', { class: 'muted' }, r === null
+          ? 'Выберите цивилизацию в шапке — карточка её правителя появится здесь.'
+          : 'загрузка…')));
+    }
+
+    /* --- двор: фракции только полосами власти и словами-позициями --- */
+    el.appendChild(h('h2', {}, 'Двор и элиты'));
+    const civIds = [...new Set((elitesData.elites || []).map((f) => f.civilization_id))];
+    if (!(elitesData.elites || []).length) {
+      el.appendChild(h('div', { class: 'muted' }, 'фракций пока нет — они формируются из экономики'));
+    }
+    for (const cid of civIds) {
+      const factions = elitesData.elites.filter((f) => f.civilization_id === cid);
+      const ul = h('ul', { class: 'feed' });
+      for (const f of factions) {
+        ul.appendChild(h('li', {},
+          h('b', { text: f.name }),
+          h('span', { class: `chip band-${f.power_band}`, text: `власть: ${f.power_band}` }),
+          h('span', { class: `chip pos-${f.position}`, text: POSITION_HINTS[f.position] || f.position }),
+          h('span', { class: 'chip', text: f.ideology }),
+          h('div', { class: 'muted small', text: POWER_BAND_HINTS[f.power_band] || '' })));
+      }
+      el.appendChild(h('div', { class: 'card' }, h('h3', { style: 'margin-top:0', text: cid }), ul));
+    }
+
+    /* --- хроника последнего хода с метками canonical / narrative --- */
+    const view = s.report && s.report.report ? s.report.report.view : null;
+    const polEvents = ((view && view.events) || [])
+      .filter((e) => e.kind === 'FortuneEvent' || e.kind === 'ConspiracyEvent' || e.narrative);
+    if (polEvents.length) {
+      el.appendChild(h('h2', {}, 'Отчёты хрониста этого хода'));
+      const list = h('ul', { class: 'feed' });
+      for (const e of polEvents) {
+        const label = e.narrative
+          ? h('span', { class: 'badge b-narrative', title: 'сказано придворным хронистом — льстит или умалчивает', text: 'нарратив' })
+          : h('span', { class: 'badge b-canonical', title: 'канонические цифры всегда честны', text: 'канон' });
+        list.appendChild(h('li', {},
+          h('b', { text: e.title || 'Событие' }), label,
+          h('div', { class: 'muted small', text: e.detail || '' })));
+      }
+      el.appendChild(list);
+    }
+
+    /* --- рынки сбыта: полосы насыщенности и кто экспортирует --- */
+    el.appendChild(h('h2', {}, 'Рынки сбыта'));
+    const niches = marketsData.markets || [];
+    const openNiches = niches.filter((n) => n.saturation_band === 'open');
+    const tbl = h('table');
+    tbl.appendChild(h('tr', {}, h('th', { text: 'ниша' }), h('th', { text: 'сектор' }),
+      h('th', { text: 'регион' }), h('th', { text: 'состояние' }), h('th', { text: 'экспортёры' })));
+    for (const n of niches.slice(0, 30)) {
+      tbl.appendChild(h('tr', {},
+        h('td', { text: n.niche }), h('td', { text: n.sector }), h('td', { text: n.region }),
+        h('td', {}, h('span', { class: `chip sat-${n.saturation_band}`,
+          text: SATURATION_LABELS[n.saturation_band] || n.saturation_band })),
+        h('td', { text: (n.exporters || []).join(', ') || '—' })));
+    }
+    el.appendChild(niches.length ? tbl : h('div', { class: 'muted' }, 'рынков пока нет'));
+    if (openNiches.length) {
+      el.appendChild(h('div', { class: 'muted small' },
+        `свободных ниш: ${openNiches.length} — первым вошедшим достается больший выигрыш`));
+    }
+
+    /* --- влияние (присутствие цивилизаций в регионах) --- */
+    const influence = (view && view.politics && view.politics.influence) || [];
+    if (influence.length) {
+      el.appendChild(h('h2', {}, 'Присутствие в регионах'));
+      const row = h('div', { class: 'grid-cards' });
+      for (const reg of influence) {
+        row.appendChild(h('div', { class: 'card' },
+          h('b', { text: reg.region }),
+          h('div', { class: 'kv' }, 'доминирует:', h('b', { text: reg.dominant || '—' })),
+          h('span', { class: `chip inf-${reg.presence_band}`, text: reg.presence_band })));
+      }
+      el.appendChild(row);
+    }
+  }
+
   /* ============================== АДМИН =================================== */
   /* §2.10 — метрики очереди, регистрация цивилизаций, цикл хода (стенд). */
   function AdminQueueScreen(el) {
@@ -821,6 +961,21 @@
         if (!list.length) box.appendChild(h('span', { class: 'muted small', text: 'реестр пуст' }));
         return box;
       })()));
+
+    /* Rev 4 (§22.8): аудит скрытых бросков — admin-only raw endpoint.
+       Сырые значения Фортуны, точные лояльности элит и ставки рынков
+       приходят ТОЛЬКО сюда (с админским токеном); игровые маршруты их
+       не содержат никогда (тест §22.9-2). */
+    el.appendChild(h('div', { class: 'card' },
+      h('h2', { style: 'margin-top:0' }, 'Аудит политического слоя (admin)'),
+      h('div', { class: 'muted small', text:
+        'Скрытые броски Фортуны, точные числа элит и ставок — только для администратора (§22.8).' }),
+      h('div', { style: 'margin-top:8px' },
+        h('button', { class: 'secondary', text: 'Загрузить raw-аудит последнего хода',
+          onclick: () => window.refreshRawAudit() })),
+      S().rawAudit
+        ? h('pre', { class: 'terminal', text: JSON.stringify(S().rawAudit, null, 2) })
+        : null));
 
     // Цикл хода (тестовый стенд): open/run с формой расписания.
     const nowIso = () => new Date().toISOString();

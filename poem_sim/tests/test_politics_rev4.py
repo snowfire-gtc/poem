@@ -706,3 +706,43 @@ def test_fortune_probability_stays_in_band():
                for a, b in zip(rolls0, rolls1))
     # table order-significant count used by roll slots
     assert len(rolls0) == len(FORTUNE_EVENTS)
+
+# ===========================================================================
+# TASK-077 — клиентские маршруты §22.8: экран «Двор» без сессии и raw-аудит
+# ===========================================================================
+
+def test_ruler_route_tolerates_missing_or_unknown_civ():
+    """Экран «Двор» открывается до выбора цивилизации: GET /ruler без
+    civilization_id отдаёт первую из реестра, а неизвестная civ — честный
+    null вместо 400 (тонкий клиент не обязан знать реестр заранее)."""
+    srv = make_political_server(seed=99, n_civs=2)
+    run_turns(srv, 1)
+    ok = srv.handle("GET", "/api/v1/worlds/w1/ruler", {})
+    assert ok["status"] == 200, ok
+    assert ok["civilization_id"] == "c1"          # первая из реестра
+    unknown = srv.handle("GET", "/api/v1/worlds/w1/ruler",
+                         {"civilization_id": "nope"})
+    assert unknown["status"] == 200
+    assert unknown["ruler"] is None
+
+
+def test_admin_raw_last_segment_matches_client_url():
+    """Клиент шлёт /admin/worlds/{id}/turns/last/raw когда номер хода
+    неизвестен (js/api.js adminRawTurn): маршрут обязан совпасть с
+    серверным last-report, а сверка turn_number проходит по query."""
+    srv = make_political_server(seed=99)
+    add_tax_law(srv, "law-tax", "c1")
+    reports = run_turns(srv, 2)
+    last_turn = reports[-1]["turn_number"]      # ответ turns/run плоский (§16)
+    h = {"Authorization": "Bearer secret-admin"}
+    by_last = srv.handle("GET", "/api/v1/admin/worlds/w1/turns/last/raw", {},
+                         headers=h)
+    assert by_last["status"] == 200, by_last
+    assert by_last["turn_number"] == last_turn
+    checked = srv.handle(
+        "GET", f"/api/v1/admin/worlds/w1/turns/{last_turn}/raw"
+               f"?turn_number={last_turn}", {}, headers=h)
+    assert checked["status"] == 200 and checked["fortune_rolls"]
+    stale = srv.handle("GET", "/api/v1/admin/worlds/w1/turns/1/raw"
+                             "?turn_number=1", {}, headers=h)
+    assert stale["status"] == 400                  # older turns need storage
