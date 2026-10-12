@@ -189,6 +189,14 @@
     declareWar(body) { return this.mutate('POST', `/wars`, body); }
     createCiv(body) { return this.mutate('POST', `/worlds/${this.worldId}/civilizations`, body); }
     civilizations() { return this.get(`/worlds/${this.worldId}/civilizations`); }
+    /* Экран «🗺 Карта» (§2.11): призма знаний цивилизации + тайлы в проекции. */
+    mapView(civId, projection) {
+      const q = new URLSearchParams();
+      if (civId) q.set('civilization_id', civId);
+      if (projection) q.set('projection', projection);
+      const qs = q.toString();
+      return this.get(`/worlds/${this.worldId}/map${qs ? '?' + qs : ''}`);
+    }
     openTurn(body) { return this.mutate('POST', `/worlds/${this.worldId}/turns/open`, body); }
     runTurn(body) { return this.mutate('POST', `/worlds/${this.worldId}/turns/run`, body); }
 

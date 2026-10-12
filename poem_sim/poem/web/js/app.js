@@ -15,7 +15,7 @@
     sessionCiv: api.civId,
     chronology: null, report: null, schedule: null,
     laws: null, pending: null, snapshot: null, drafts: null,
-    images: null, metrics: null, tokens: null,
+    images: null, metrics: null, tokens: null, map: null,
     lawDetail: {},                              // law_id -> GET /laws/{id}
   };
 
@@ -33,6 +33,7 @@
     ['draft',      /^\/drafts\/([^/]+)$/,          'DraftEditorScreen'],
     ['pending',    /^\/pending$/,                  'PendingScreen'],
     ['diplomacy',  /^\/diplomacy$/,                'DiplomacyScreen'],
+    ['map',        /^\/map$/,                    'MapScreen'],
     ['gallery',    /^\/gallery$/,                  'GalleryScreen'],
     ['adminQueue', /^\/admin\/queue$/,             'AdminQueueScreen'],
     ['adminWorld', /^\/admin\/world$/,             'AdminWorldScreen'],
@@ -99,6 +100,14 @@
   async function refreshMetrics() { store.metrics = await api.imageMetrics(); }
   async function refreshTokens() { store.tokens = await api.tokens(); }
 
+  /* Карта — по запросу экрана (не поллится): серверная призма знаний
+     цивилизации + проекция из localStorage клиента (ui-client.md §2.11). */
+  window.refreshMap = async function () {
+    const proj = localStorage.getItem('poem.map.projection') || 'equirectangular';
+    store.map = await api.mapView(store.sessionCiv || undefined, proj);
+    return store.map;
+  };
+
   async function refreshLawDetail(id) {
     store.lawDetail[id] = await api.law(id);
   }
@@ -140,6 +149,7 @@
     ['#/drafts',     '✍', 'Черновики'],
     ['#/pending',    '🗂', 'Правки'],
     ['#/diplomacy',  '🤝', 'Диплом.'],
+    ['#/map',        '🗺', 'Карта'],
     ['#/gallery',    '🖼', 'Галерея'],
   ];
   const ADMIN_NAV = [
@@ -255,6 +265,7 @@
     DraftEditorScreen: async () => {},           // сам тянет черновик (editor state)
     PendingScreen:    async () => { await refreshPendingBundles(); },
     DiplomacyScreen:  async () => { await refreshReport(); },
+    MapScreen:        async () => { await Promise.allSettled([refreshChronology(), refreshMap()]); },
     GalleryScreen:    async () => { await refreshImages(); },
     AdminQueueScreen: async () => { await refreshMetrics(); },
     AdminWorldScreen: async () => { await Promise.allSettled([refreshChronology(), refreshTokens()]); },

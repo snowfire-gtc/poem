@@ -352,6 +352,29 @@ class WorldServer:
                 result[cid] = cen
         return {"language": result}
 
+    # ================= map view (TASK: экран «Карта», ui-client.md §2.11) ===
+
+    def get_map_view(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/map?civilization_id=&projection= — карта
+        территорий через призму знаний цивилизации игрока.
+
+        Ответ — проекция знания, а не сырое состояние мира (§22.8): свои
+        земли описаны законом и переписью подробно, соседи видны ровно
+        настолько, насколько до них дошло слово (mutual_intelligibility),
+        неведомые — Terra Incognita с мифами и преданиями народа. Тайлы
+        спроецированы в выбранной проекции; ``visits`` показывает, сколько
+        мест экспедиция может посетить за ход (транспортные сети и технологии).
+        Детерминизм: тот же мир + тот же ход + та же проекция ⇒ байт-идентичный
+        ответ (§4.1); wall-clock не участвует (§20.4).
+        """
+        from .mapview import PROJECTIONS, build_full_map
+        civ_id = body.get("civilization_id") or body.get("civ_id")
+        projection = str(body.get("projection") or "equirectangular")
+        if projection not in PROJECTIONS:
+            raise ValueError(f"unknown projection {projection!r}; "
+                             f"expected one of {list(PROJECTIONS)}")
+        return {"map": build_full_map(self, civ_id or None, projection)}
+
     # ------------------------------------------------------------- handlers
 
     def _check_admin(self, token: str | None) -> None:
@@ -1336,7 +1359,7 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "wars", "status", "images", "claim", "complete", "heartbeat",
                  "asset", "civilizations", "cost_preview", "metrics", "validate",
-                 "tokens", "condition"}
+                 "tokens", "condition", "map", "settlements", "language"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -1451,6 +1474,16 @@ _ROUTE_TABLE = [
     # не может populate мир (§9 — эпоха определяется по цивилизациям).
     ("POST", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.create_civilization),
     ("GET", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.list_civilizations),
+    # Экран «🗺 Карта» (ui-client.md §2.11): территории через призму знаний
+    # цивилизации игрока — свои подробно, соседи по понятности речи,
+    # неведомые как Terra Incognita с мифами; + бюджет посещений за ход.
+    ("GET", r"^/api/v1/worlds/\{id\}/map$", WorldServer.get_map_view),
+    # Поселения — носители местной речи (нужны админу для populate мира и
+    # клиенту — для карты; ранее были только в коде, но не в таблице маршрутов).
+    ("POST", r"^/api/v1/worlds/\{id\}/settlements$", WorldServer.add_settlement),
+    ("GET", r"^/api/v1/worlds/\{id\}/settlements$", WorldServer.get_settlements),
+    ("GET", r"^/api/v1/worlds/\{id\}/language$", WorldServer.get_language_census),
+    ("GET", r"^/api/v1/worlds/\{id\}/language/\{id\}$", WorldServer.get_language_census),
     ("GET", r"^/api/v1/worlds/\{id\}/chronology$", WorldServer.get_chronology),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/open$", WorldServer.open_turn),
     ("POST", r"^/api/v1/worlds/\{id\}/turns/run$", WorldServer.run_turn),

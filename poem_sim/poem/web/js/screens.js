@@ -857,6 +857,131 @@
       runLog));
   }
 
+  /* ================================ КАРТА ================================ */
+  /* #/map — ui-client.md §2.11: карта территорий через призму знаний
+     цивилизации игрока. Клиент рисует ТОЛЬКО то, что прислал сервер: свои
+     земли подробно, соседи по понятности речи, неведомые — Terra Incognita
+     с мифами народа; внизу — куда можно послать экспедицию в этом ходу. */
+  const PROJECTION_LABELS = {
+    equirectangular: 'Прямая (равнопромежуточная)',
+    mercator: 'Меркатор',
+    conic: 'Коническая',
+  };
+  let mapProjection = localStorage.getItem('poem.map.projection') || 'equirectangular';
+
+  function MapScreen(el) {
+    const s = S();
+    const m = s.map && s.map.map ? s.map.map : null;
+    if (!m || !m.civilization_id) {
+      el.appendChild(h('h1', {}, '🗺 Карта'));
+      el.appendChild(h('div', { class: 'muted' },
+        m && !m.civilization_id ? 'в мире нет цивилизаций — карта пуста'
+                                : 'Выберите цивилизацию в шапке — карта строится через её призму знаний.'));
+      return;
+    }
+    const head = h('div', { class: 'row', style: 'align-items:center' },
+      h('h1', { style: 'margin:0' }, '🗺 Карта '),
+      h('span', { class: 'chip', text: `${m.civilization_name} · ход ${m.turn} · ${m.world_year} г.` }),
+      m.narrative ? P.badge(['b-orange', '⚠ летописная картина (искажена лестью двора)'])
+                  : P.badge(['b-teal', 'канон']),
+      h('div', { class: 'spacer' }));
+    const projSel = h('select', { title: 'картографическая проекция' });
+    for (const p of (m.projections_available || ['equirectangular'])) {
+      projSel.appendChild(h('option', { value: p, selected: p === m.projection,
+        text: PROJECTION_LABELS[p] || p }));
+    }
+    projSel.addEventListener('change', () => {
+      mapProjection = projSel.value;
+      localStorage.setItem('poem.map.projection', mapProjection);
+      refreshMap().then(rerender).catch(P.toastError);
+    });
+    head.appendChild(projSel);
+    el.appendChild(head);
+    el.appendChild(h('div', { class: 'muted small', text: m.note || '' }));
+
+    /* --- сетка тайлов: x/y нормализуем в 0..9 по известному диапазону --- */
+    const tiles = m.tiles || [];
+    const xs = tiles.map((t) => t.xy[0]), ys = tiles.map((t) => t.xy[1]);
+    const norm = (v, arr) => {
+      const lo = Math.min(...arr), hi = Math.max(...arr);
+      return hi > lo ? Math.round(((v - lo) / (hi - lo)) * 9) : 4;
+    };
+    const grid = h('div', { class: 'map-grid card' });
+    const byCell = {};
+    for (const t of tiles) byCell[`${norm(t.xy[0], xs)}:${norm(t.xy[1], ys)}`] = t;
+    for (let gy = 0; gy < 10; gy++) {
+      const rowEl = h('div', { class: 'map-row' });
+      for (let gx = 0; gx < 10; gx++) {
+        const t = byCell[`${gx}:${gy}`];
+        let cell;
+        if (!t) cell = h('div', { class: 'map-cell unknown terra', title: 'за пределом слова', text: '☁' });
+        else if (t.knowing === 'unknown')
+          cell = h('div', { class: 'map-cell unknown myth', title: t.myth || '', text: '⁂' });
+        else cell = h('div', { class: `map-cell k-${t.knowing}` },
+          h('span', { class: 'glyph', text: t.glyph || '•' }),
+          h('span', { class: 'place', text: t.place_name || t.lore_name || '?' }),
+          t.lore_name ? h('span', { class: 'epithet', text: t.lore_name }) : null);
+        if (t) cell.title = [t.place_name || t.lore_name,
+                             t.knowing === 'unknown' ? (t.myth || '') : ''].filter(Boolean).join(' · ');
+        rowEl.appendChild(cell);
+      }
+      grid.appendChild(rowEl);
+    }
+    el.appendChild(grid);
+
+    /* --- легенда уровней познания --- */
+    const legend = h('div', { class: 'row' });
+    for (const lv of ((m.legend && m.legend.levels) || [])) {
+      legend.appendChild(h('span', { class: `legend k-${lv.level}`, title: lv.hint },
+        `${lv.label} — ${lv.hint}`));
+    }
+    el.appendChild(h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Рубежи познания'), legend));
+
+    /* --- знания, слухи и мифы --- */
+    const knLayer = (m.layers || []).find((l) => l.id === 'knowledge');
+    if (knLayer && knLayer.items.length) {
+      const ul = h('ul', { class: 'map-lore' });
+      for (const it of knLayer.items) {
+        ul.appendChild(h('li', { class: 'lore-' + (it.kind || 'note') },
+          h('b', { text: { terra_incognita: 'Terra Incognita', rumor: 'слухи',
+                           law_measure: 'измерение закона', chronicle: 'хроника' }[it.kind] || it.kind }),
+          ' — ', it.text || ''));
+      }
+      el.appendChild(h('div', { class: 'card' }, h('h2', { style: 'margin-top:0' }, 'Знания, слухи и предания'), ul));
+    }
+
+    /* --- куда можно пойти в этом ходу --- */
+    const tr = m.travel || {};
+    el.appendChild(h('div', { class: 'card' },
+      h('h2', { style: 'margin-top:0' }, `Экспедиции этого хода: до ${tr.visits_per_turn ?? '—'} мест`),
+      h('div', { class: 'muted small', text: tr.explanation || '' }),
+      tableVisits(m.visits && m.visits.options)));
+  }
+
+  function tableVisits(options) {
+    const tbl = h('table');
+    tbl.appendChild(h('tr', {}, h('th', { text: 'место' }), h('th', { text: 'познание' }),
+      h('th', { text: 'дни пути' }), h('th', { text: 'посетить' })));
+    for (const v of options || []) {
+      tbl.appendChild(h('tr', {},
+        h('td', { text: v.name }),
+        h('td', {}, h('span', { class: `legend k-${v.knowing}`, text: v.knowing === 'known' ? 'изведано' : v.knowing === 'dim' ? 'смутно' : 'неведомо' })),
+        h('td', { text: String(v.travel_days) }),
+        h('td', {}, v.reachable_this_turn
+          ? h('button', { class: 'secondary', text: 'Посетить', onclick: () => visitPlace(v) })
+          : h('span', { class: 'muted small', text: v.reason || 'недоступно' }))));
+    }
+    if (!(options || []).length) return h('div', { class: 'muted', text: 'известных для посещений мест пока нет' });
+    return tbl;
+  }
+
+  async function visitPlace(v) {
+    // Посещение — действие над состоянием мира; сервер ещё не принимает
+    // POST /visits, поэтому честно говорим клиенту, что запись появится,
+    // когда маршрут будет добавлен (тонкий клиент ничего не симулирует).
+    P.toast(`Экспедиция в «${v.name}» (${v.travel_days} дн. пути): приём заявок на посещение будет на сервере`, 'error');
+  }
+
   /* ================================ ЛОГИН ================================ */
   /* #/login — вход в мир: проверка доступности GET chronology (§8). */
   function LoginScreen(el) {
@@ -888,6 +1013,6 @@
   window.Screens = {
     DashboardScreen, ChronicleScreen, LawsScreen, LawCardScreen,
     DraftsScreen, DraftEditorScreen, PendingScreen, DiplomacyScreen,
-    GalleryScreen, AdminQueueScreen, AdminWorldScreen, LoginScreen,
+    GalleryScreen, MapScreen, AdminQueueScreen, AdminWorldScreen, LoginScreen,
   };
 })();
