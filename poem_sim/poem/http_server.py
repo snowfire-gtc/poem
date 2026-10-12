@@ -39,11 +39,29 @@ import json
 import mimetypes
 import os
 import sys
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .api import ADMIN_TOKEN_ENV, WorldServer, _path_id
-from .core import EraSource, GameSpeed, SeasonId
+from .core import EraSource, GameSpeed, SeasonId, TurnStatus
+
+# ---------------------------------------------------------------------------
+# Static web client (ui-client.md §8): the SPA bundle is served by the same
+# server next to /api/v1 — same origin, no CORS, no external CDNs, so the
+# game stays playable on an air-gap server.  The directory lives inside the
+# package ("poem/web") so `pip install poem-sim` ships the UI as package data.
+# ---------------------------------------------------------------------------
+WEB_DIR = Path(__file__).resolve().parent / "web"
+_INDEX_HTML: bytes | None = None
+
+
+def _index_html() -> bytes:
+    global _INDEX_HTML
+    if _INDEX_HTML is None:
+        index = WEB_DIR / "index.html"
+        _INDEX_HTML = index.read_bytes() if index.is_file() else b""
+    return _INDEX_HTML
 
 
 def make_server(
@@ -144,6 +162,75 @@ class PoemHTTPRequestHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    # ------------------------------------------------------- turn schedule
+    def _turn_schedule(self) -> None:
+        """Expose the *technical schedule* of the open turn (§6.1).
+
+        ``simulation_cutoff_at`` is a wall-clock scheduling marker only — it
+        orders edits deterministically and grants no time-of-day bonuses or
+        penalties (§2).  The dashboard's cutoff timer and the interval-shift
+        banner read this endpoint; both are plain GETs so the thin client can
+        poll them without credentials.
+        """
+        ws = self.server.world_server
+        turn = ws.engine.current_turn
+        last_report = ws.published_reports[-1] if ws.published_reports else None
+        payload: dict = {"turn_open": turn is not None}
+        if turn is not None:
+            payload.update({
+                "turn_id": turn.id,
+                "turn_number": turn.number,
+                "status": turn.status.value,
+                "processing": turn.status in (TurnStatus.SIMULATING,
+                                              TurnStatus.FINALIZING),
+                "started_at": turn.started_at.isoformat(),
+                "simulation_cutoff_at": turn.simulation_cutoff_at.isoformat(),
+                "planned_span_years": turn.turn_span.years,
+                "note": ("Срез хода — техническое расписание (§6.1). "
+                         "Время подачи правки не влияет на эффективность."),
+            })
+        if last_report is not None:
+            view = last_report.get("view") or {}
+            dash = view.get("dashboard") or {}
+            payload["last_report"] = {
+                "turn_number": last_report.get("turn_number"),
+                "years_elapsed": last_report.get("years_elapsed"),
+                "span_years_next": dash.get("next_turn_span_years"),
+            }
+        self._json(200, payload)
+
+    # ------------------------------------------------------ static client
+    def _try_static(self) -> bool:
+        """Serve the bundled SPA (ui-client.md §8: same origin as /api/v1)."""
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path.startswith("/api/"):
+            return False
+        if path in ("/", "/index.html"):
+            html = _index_html()
+            if not html:
+                return False
+            self._binary(200, html, "text/html; charset=utf-8",
+                         {"Cache-Control": "no-cache"})
+            return True
+        candidate = (WEB_DIR / path.lstrip("/")).resolve()
+        root = WEB_DIR.resolve()
+        if str(candidate).startswith(str(root) + os.sep) and candidate.is_file():
+            media = (mimetypes.guess_type(str(candidate))[0]
+                     or "application/octet-stream")
+            if media.startswith("text/") or media == "application/javascript":
+                media += "; charset=utf-8"
+            self._binary(200, candidate.read_bytes(), media,
+                         {"Cache-Control": "no-cache"})
+            return True
+        # Unknown non-API path: SPA fallback to index.html when the client
+        # bundle is installed (deep links survive a page refresh); otherwise
+        # fall through to the JSON router (structured 404).
+        if path.startswith("/admin") and _index_html():
+            self._binary(200, _index_html(), "text/html; charset=utf-8",
+                         {"Cache-Control": "no-cache"})
+            return True
+        return False
+
     # ------------------------------------------------------------- verbs
     def do_GET(self) -> None:      # noqa: N802 (BaseHTTPRequestHandler API)
         if self.path == "/healthz":
@@ -152,7 +239,12 @@ class PoemHTTPRequestHandler(BaseHTTPRequestHandler):
                              "world": ws.chronology.world_id,
                              "turn": ws.chronology.current_turn})
             return
+        if self.path.split("?", 1)[0] == "/api/v1/turn/schedule":
+            self._turn_schedule()
+            return
         if self._try_asset_binary():
+            return
+        if self._try_static():
             return
         self._dispatch("GET")
 
