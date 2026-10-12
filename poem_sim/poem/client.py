@@ -46,7 +46,10 @@ Example (remote mode):
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -389,8 +392,12 @@ class HttpClient(_BaseClient):
         query = _encode_params(params)
         if query:
             url += "?" + query
+        # GET/DELETE must not carry a body: stdlib http.server answers such
+        # requests with 501 UnsupportedMethod ('GET' allowed; 'request_body'
+        # specified), so only mutating verbs get JSON payloads.
+        has_body = body is not None and method.upper() not in ("GET", "HEAD", "DELETE")
         data = json.dumps(_merge(body, params), ensure_ascii=False).encode("utf-8") \
-            if (body is not None or params) else None
+            if has_body else None
         req = urllib.request.Request(url, data=data, method=method)
         if data is not None:
             req.add_header("Content-Type", "application/json")
@@ -452,3 +459,175 @@ def _merge(body: dict | None, params: dict | None) -> dict:
         if v is not None:
             merged.setdefault(k, v)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# CLI wrapper — «python -m poem.client» (guide_client.md §1: тот же тонкий
+# клиент из командной строки; удобен для smoke-тестов сервера без браузера).
+# ---------------------------------------------------------------------------
+
+def _cli_build_client(args) -> _BaseClient:
+    if getattr(args, "library", False):
+        from .api import WorldServer  # local import: CLI-only convenience
+        ws = WorldServer(args.world, asset_dir=args.asset_dir,
+                         admin_token=args.token or "")
+        return LibraryClient(ws, world_id=args.world, admin_token=args.token)
+    base = args.server
+    if not base:
+        raise SystemExit("error: pass --server URL or --library "
+                         "(or set POEM_SERVER_URL)")
+    return HttpClient(base, admin_token=args.token, world_id=args.world)
+
+
+def _cli_out(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
+
+
+FAR_FUTURE_CLI = datetime(2999, 1, 1, tzinfo=timezone.utc)
+
+
+def _cmd_status(api: _BaseClient, args) -> None:
+    ch = api.get_chronology()
+    report = api.get_report()
+    out = {"chronology": ch, "dashboard": api.dashboard_lines(report)}
+    if report is not None:
+        out["last_turn"] = report.get("turn_number")
+    _cli_out(out)
+
+
+def _cmd_laws_list(api: _BaseClient, args) -> None:
+    _cli_out(api.list_laws(civilization_id=args.civilization))
+
+
+def _cmd_law_create(api: _BaseClient, args) -> None:
+    _cli_out(api.create_law(args.civilization, args.title, args.text))
+
+
+def _cmd_draft_create(api: _BaseClient, args) -> None:
+    _cli_out(api.create_draft(args.civilization, args.text, title=args.title))
+
+
+def _cmd_drafts_list(api: _BaseClient, args) -> None:
+    _cli_out(api.get_drafts(args.civilization))
+
+
+def _cmd_draft_validate(api: _BaseClient, args) -> None:
+    _cli_out(api.validate_draft(args.draft_id))
+
+
+def _cmd_pending(api: _BaseClient, args) -> None:
+    _cli_out(api.get_pending())
+
+
+def _cmd_snapshot(api: _BaseClient, args) -> None:
+    _cli_out(api.get_snapshot())
+
+
+def _cmd_civ_add(api: _BaseClient, args) -> None:
+    civ = {"id": args.civilization, "name": args.name}
+    if args.progress is not None:
+        civ["progress"] = args.progress
+    _cli_out(api.add_civilization(civ))
+
+
+def _cmd_run_turn(api: _BaseClient, args) -> None:
+    cutoff = datetime.fromtimestamp(args.cutoff_at, tz=timezone.utc) \
+        if args.cutoff_at is not None else FAR_FUTURE_CLI
+    started = datetime.fromtimestamp(args.started_at, tz=timezone.utc) \
+        if args.started_at is not None else cutoff - timedelta(days=1)
+    report = api.run_turn(started_at=started, simulation_cutoff_at=cutoff,
+                          seed=args.seed)
+    _cli_out({"report_turn": report.get("turn_number"),
+              "dashboard": api.dashboard_lines(report),
+              "notices": report.get("notices", [])})
+
+
+def _cmd_images(api: _BaseClient, args) -> None:
+    _cli_out(api.list_image_tasks(status=args.status))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="poem.client",
+        description="Thin game client for the Poem server (guide_client.md §5).")
+    parser.add_argument("--server", default=os.environ.get("POEM_SERVER_URL"),
+                        help="base URL of a running poem.http_server, "
+                             "e.g. http://localhost:8080 (env POEM_SERVER_URL)")
+    parser.add_argument("--token", default=os.environ.get("POEM_ADMIN_TOKEN"),
+                        help="admin bearer token (env POEM_ADMIN_TOKEN)")
+    parser.add_argument("--world", default=os.environ.get("POEM_WORLD_ID", "world"),
+                        help="world id (env POEM_WORLD_ID)")
+    parser.add_argument("--library", action="store_true",
+                        help="in-process mode: embed WorldServer instead of "
+                             "talking HTTP (guide_client.md §1 «через библиотеку»)")
+    parser.add_argument("--asset-dir",
+                        help="asset directory for --library mode")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("status", help="banner + dashboard lines (§16.1)")
+    p.set_defaults(func=_cmd_status)
+
+    p = sub.add_parser("laws", help="list law cards")
+    p.add_argument("--civilization", default=None)
+    p.set_defaults(func=_cmd_laws_list)
+
+    p = sub.add_parser("law-create", help="POST /laws")
+    p.add_argument("--civilization", required=True)
+    p.add_argument("--title", required=True)
+    p.add_argument("text", help="raw legal text as typed by the player")
+    p.set_defaults(func=_cmd_law_create)
+
+    p = sub.add_parser("draft-create", help="POST /laws/drafts")
+    p.add_argument("--civilization", required=True)
+    p.add_argument("--title", default=None)
+    p.add_argument("text")
+    p.set_defaults(func=_cmd_draft_create)
+
+    p = sub.add_parser("drafts", help="GET /laws/drafts?civilization_id=")
+    p.add_argument("--civilization", required=True)
+    p.set_defaults(func=_cmd_drafts_list)
+
+    p = sub.add_parser("draft-validate", help="POST /laws/drafts/{id}/validate")
+    p.add_argument("draft_id")
+    p.set_defaults(func=_cmd_draft_validate)
+
+    p = sub.add_parser("pending", help="GET /laws/pending (six baskets, §15.3)")
+    p.set_defaults(func=_cmd_pending)
+
+    p = sub.add_parser("snapshot", help="GET /laws/snapshot (inspector, §4.3)")
+    p.set_defaults(func=_cmd_snapshot)
+
+    p = sub.add_parser("civ-add", help="POST /worlds/{id}/civilizations")
+    p.add_argument("--civilization", required=True, help="new civilization id")
+    p.add_argument("--name", required=True)
+    p.add_argument("--progress", type=float, default=None,
+                   help="0..1 progress used for era determination (§7.2)")
+    p.set_defaults(func=_cmd_civ_add)
+
+    p = sub.add_parser("run-turn", help="open+run a turn, print dashboard")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--started-at", type=float, default=None, metavar="UNIX_TS",
+                   help="turn start instant (unix seconds); default: cutoff-1d")
+    p.add_argument("--cutoff-at", type=float, default=None, metavar="UNIX_TS",
+                   help="simulation cutoff instant (unix seconds); default: far "
+                        "future so the first turn actually runs")
+    p.set_defaults(func=_cmd_run_turn)
+
+    p = sub.add_parser("images", help="GET /worlds/{id}/images (queue)")
+    p.add_argument("--status", default=None)
+    p.set_defaults(func=_cmd_images)
+
+    args = parser.parse_args(argv)
+    api = _cli_build_client(args)
+    try:
+        args.func(api, args)
+    except ApiError as exc:
+        # §6: show the server notice verbatim, never rephrase it.
+        print(f"error {exc.status}: {exc.payload.get('error') if exc.payload else exc}",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

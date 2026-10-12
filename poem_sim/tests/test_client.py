@@ -275,3 +275,105 @@ def test_library_asset_base64_roundtrip(tmp_path):
         "success": True,
         "asset_base64": base64.b64encode(PNG_BYTES).decode("ascii")})
     assert api.get_image_asset(tid) == PNG_BYTES
+
+
+# ---------------------------------------------------------------- CLI wrapper
+
+def _cli(argv):
+    """Run the client CLI, return (exit_code, stdout, stderr)."""
+    import contextlib, io
+    from poem.client import main as cli_main
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli_main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_cli_library_full_cycle(tmp_path, capsys):
+    world = "clitest"
+    common = ["--library", "--world", world, "--token", TOKEN,
+              "--asset-dir", str(tmp_path)]
+    code, out, _ = _cli(common + ["civ-add", "--civilization", "c1",
+                                  "--name", "Ромашки", "--progress", "0.3"])
+    assert code == 0 and json.loads(out)["status"] == 200
+
+    code, out, _ = _cli(common + ["law-create", "--civilization", "c1",
+                                  "--title", "Налог", "Все платят 1 монету"])
+    assert code == 0
+    law_id = json.loads(out)["law_id"]
+
+    code, out, _ = _cli(common + ["laws"])
+    assert code == 0 and len(json.loads(out)["laws"]) == 1
+
+    code, out, _ = _cli(common + ["draft-create", "--civilization", "c1",
+                                  "--title", "Черновик", "Запретить войны"])
+    draft_id = json.loads(out)["draft"]["id"] if "draft" in json.loads(out) \
+        else json.loads(out)["id"]
+
+    code, out, _ = _cli(common + ["draft-validate", draft_id])
+    assert code == 0
+
+    code, out, _ = _cli(common + ["run-turn", "--seed", "5"])
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["report_turn"] == 1
+    dash = payload["dashboard"]
+    assert dash[0] == "Ход: 1"
+    assert any("Следующий ход охватит" in line for line in dash)
+
+    code, out, _ = _cli(common + ["status"])
+    assert code == 0
+    st = json.loads(out)
+    assert st["last_turn"] == 1
+    assert len(st["dashboard"]) >= 5
+
+    code, out, _ = _cli(common + ["pending"])
+    assert code == 0 and isinstance(json.loads(out), dict)
+
+    code, out, _ = _cli(common + ["snapshot"])
+    assert code == 0
+
+    code, out, _ = _cli(common + ["images"])
+    assert code == 0
+
+
+def test_cli_reports_server_error_verbatim(tmp_path):
+    common = ["--library", "--world", "clip", "--token", TOKEN,
+              "--asset-dir", str(tmp_path)]
+    _cli(common + ["civ-add", "--civilization", "c1", "--name", "X"])
+    code, _, err = _cli(common + ["civ-add", "--civilization", "c1",
+                                  "--name", "Дубликат"])
+    assert code == 1
+    # §6: the server's own wording is printed unchanged
+    assert "error 400" in err and "already exists" in err
+
+
+def test_cli_requires_server_or_library(monkeypatch):
+    monkeypatch.delenv("POEM_SERVER_URL", raising=False)
+    with pytest.raises(SystemExit):
+        _cli(["status"])
+
+
+def test_cli_http_mode_against_real_server(tmp_path):
+    """CLI --server drives the same commands over the HTTP front-end."""
+    import threading
+    from poem.http_server import PoemHTTPRequestHandler, PoemHTTPServer, make_server
+    ws = make_server(world_id="httpcli", asset_dir=tmp_path, admin_token=TOKEN)
+    httpd = PoemHTTPServer(("127.0.0.1", 0), PoemHTTPRequestHandler, ws)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        common = ["--server", base, "--token", TOKEN, "--world", "httpcli"]
+        code, out, _ = _cli(common + ["civ-add", "--civilization", "c1",
+                                      "--name", "Ромашки"])
+        assert code == 0
+        code, out, _ = _cli(common + ["run-turn", "--seed", "2"])
+        assert code == 0
+        assert json.loads(out)["report_turn"] == 1
+        code, out, _ = _cli(common + ["laws"])
+        assert code == 0 and json.loads(out) == []
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
