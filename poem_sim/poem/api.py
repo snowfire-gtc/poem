@@ -421,8 +421,12 @@ class WorldServer:
         if handler is None:
             return {"error": f"no route {method} {path}", "status": 404}
         # §15 security addendum: mutating routes are world administration.
-        # Read-only GETs stay public so the game client can poll state.
-        if method.upper() in {"POST", "PUT", "DELETE", "PATCH"}:
+        # Read-only GETs stay public so the game client can poll state —
+        # EXCEPT the Rev 4 admin audit route (§22.8): it ships hidden rolls
+        # and exact loyalties, so it demands the admin token like a mutation
+        # (test §22.9-2: no client path may ever expose raw rolls).
+        if method.upper() in {"POST", "PUT", "DELETE", "PATCH"} \
+                or handler is WorldServer.get_admin_raw_turn:
             admin_tok, worker_tok = _extract_credential(headers, body)
             try:
                 if handler in _WORKER_ROUTES:
@@ -907,6 +911,128 @@ class WorldServer:
             return {"report": None}
         return {"report": self.published_reports[-1]}
 
+    # ================= Rev 4 political endpoints (§22.8) ===================
+
+    def get_elites(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/elites — public faction projections.
+
+        §22.8: clients receive power BANDS and position words only — exact
+        loyalty/grievance/ambition numbers never leave the server
+        (test §22.9-2). Live state is read from the engine so the screen
+        stays correct between turns; while politics is disabled the answer
+        is an honest empty list (Rev-3 worlds have no court).
+        """
+        factions = [f for civ_id in sorted(self.engine.factions)
+                    for f in self.engine.factions[civ_id]]
+        return {"elites": [f.to_public_json() for f in factions],
+                "politics_enabled": self.engine.politics.enabled}
+
+    def get_ruler(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/ruler — ruler card, bands not numbers.
+
+        §22.8: style ships as a RANGE band (tyrannic/hard-handed/moderate/
+        liberal), never the exact hidden axis value; cruelty accumulator,
+        dao_balance and self_deception are server-side secrets (§22.5).
+        ``public_virtues`` is the one rounded figure the court advertises.
+        """
+        civ_id = body.get("civilization_id") or ""
+        civ = self.civilizations.get(civ_id)
+        if civ is None:
+            raise ValueError(f"unknown civilization {civ_id!r}")
+        r = civ.ruler
+        if r is None:
+            return {"civilization_id": civ_id, "ruler": None,
+                    "politics_enabled": self.engine.politics.enabled}
+        style = r.style
+        band = ("tyrannic" if style > 0.5 else
+                "hard-handed" if style > 0.15 else
+                "liberal" if style < -0.15 else "moderate")
+        return {
+            "civilization_id": civ_id,
+            "politics_enabled": self.engine.politics.enabled,
+            "ruler": {
+                "name": r.name,
+                "style_band": band,               # range, never exact number
+                "public_virtues": round(r.statecraft, 2),
+                "ascended_year": r.ascended_year,
+                "origin_faction": r.origin_faction,
+                "canonical": True,
+            },
+        }
+
+    def get_markets(self, path: str, body: dict) -> dict:
+        """GET /api/v1/worlds/{id}/markets — saturation bands & exporters.
+
+        §22.8: rivals' bids stay in the server's hidden audit; the client
+        sees demand/saturation bands and WHO exports where (the visible
+        pressure of competition), never stake sizes.
+        """
+        niches = [n.to_public_json()
+                  for n in self.engine.niche_map.values()]
+        return {"markets": niches,
+                "politics_enabled": self.engine.politics.enabled}
+
+    def get_admin_raw_turn(self, path: str, body: dict) -> dict:
+        """GET /api/v1/admin/worlds/{id}/turns/{n}/raw — admin-only audit.
+
+        TASK-076 (§22.8): the full truth of one finalized turn — hidden
+        Fortune rolls with raw values and thresholds, exact elite numbers,
+        conspiracy roll audits, succession picks, market bids and the
+        canonical (undistorted) chronicle copy. Guarded by the admin
+        credential like every mutating route (§15 security addendum);
+        this endpoint is the ONLY place these figures surface at all.
+        """
+        import json as _json
+        report = self.engine.last_report
+        if report is None:
+            raise ValueError("no finalized turn yet")
+        wanted = body.get("turn_number")
+        if wanted is not None and report.turn_number != int(wanted):
+            raise ValueError(
+                f"only the last finalized turn is auditable over HTTP "
+                f"(current: {report.turn_number}); older snapshots need "
+                f"the persistence layer")
+        # deep copy via JSON round trip — the audit must never alias live
+        # state, and non-serializable members fail loudly here, not later
+        audit = _json.loads(_json.dumps(
+            report.hidden_audit, default=lambda o: getattr(o, "__dict__", str(o))))
+        rolls: list[dict] = []
+        for snap in report.snapshots:
+            for roll in snap.fortune_rolls:
+                rolls.append({
+                    "civ_id": roll.civ_id or snap.civilization_id,
+                    "event_id": roll.event_id, "title": roll.title,
+                    "severity": roll.severity, "roll_value": roll.roll_value,
+                    "threshold": roll.threshold, "struck": roll.success})
+        exact_elites: list[dict] = []
+        for civ_id in sorted(self.engine.factions):
+            for f in self.engine.factions[civ_id]:
+                exact_elites.append({
+                    "faction_id": f.id, "name": f.name,
+                    "power": round(f.power, 6), "loyalty": round(f.loyalty, 6),
+                    "grievance": round(f.grievance, 6),
+                    "ambition": round(f.ambition, 6),
+                    "wealth_stock": round(f.wealth_stock, 6),
+                    "ideology": f.ideology.value, "hostile": f.hostile})
+        rulers: dict[str, dict] = {}
+        for cid, civ in self.civilizations.items():
+            if civ.ruler is not None:
+                r = civ.ruler
+                rulers[cid] = {
+                    "name": r.name, "style": round(r.style, 6),
+                    "statecraft": round(r.statecraft, 6),
+                    "cruelty_accumulator": round(r.cruelty_accumulator, 6),
+                    "dao_balance": round(r.dao_balance, 6),
+                    "self_deception": round(r.self_deception, 6)}
+        return {
+            "turn_number": report.turn_number,
+            "hidden_audit": audit,
+            "fortune_rolls": rolls,
+            "elites_exact": exact_elites,
+            "rulers_exact": rulers,
+            "canonical": True,
+        }
+
     def list_laws(self, path: str, body: dict) -> dict:
         civ = body.get("civilization_id")
         laws = self.store.laws_of(civ) if civ else list(self.store._laws.values())
@@ -1359,7 +1485,10 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
                  "snapshot", "turns", "report", "api", "v1", "submit", "cancel", "treaties",
                  "wars", "status", "images", "claim", "complete", "heartbeat",
                  "asset", "civilizations", "cost_preview", "metrics", "validate",
-                 "tokens", "condition", "map", "settlements", "language"}
+                 "tokens", "condition", "map", "settlements", "language",
+                 # Rev 4 (§22.8): политические коллекции и admin raw-аудит —
+                 # literal-сегменты, не сворачиваются в {id}
+                 "elites", "ruler", "markets", "admin", "raw"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -1474,6 +1603,18 @@ _ROUTE_TABLE = [
     # не может populate мир (§9 — эпоха определяется по цивилизациям).
     ("POST", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.create_civilization),
     ("GET", r"^/api/v1/worlds/\{id\}/civilizations$", WorldServer.list_civilizations),
+    # Rev 4 (§22.8): политический слой. Клиентские маршруты отдают ТОЛЬКО
+    # публичные проекции (полосы power/стиля, позиции фракций, насыщенность
+    # ниш) — точные loyalty/grievance/ambition и сырые броски Фортуны не
+    # покидают сервер (тест §22.9-2). Admin raw-маршрут требует токен наравне
+    # с изменяющими маршрутами (§15 security addendum).
+    ("GET", r"^/api/v1/worlds/\{id\}/elites$", WorldServer.get_elites),
+    ("GET", r"^/api/v1/worlds/\{id\}/ruler$", WorldServer.get_ruler),
+    ("GET", r"^/api/v1/worlds/\{id\}/markets$", WorldServer.get_markets),
+    ("GET", r"^/api/v1/admin/worlds/\{id\}/turns/\{id\}/raw$",
+     WorldServer.get_admin_raw_turn),
+    ("GET", r"^/api/v1/admin/worlds/\{id\}/turns/raw$",
+     WorldServer.get_admin_raw_turn),
     # Экран «🗺 Карта» (ui-client.md §2.11): территории через призму знаний
     # цивилизации игрока — свои подробно, соседи по понятности речи,
     # неведомые как Terra Incognita с мифами; + бюджет посещений за ход.

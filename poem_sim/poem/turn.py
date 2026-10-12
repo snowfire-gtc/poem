@@ -904,6 +904,7 @@ class TurnEngine:
         # then the court chronicler distorts the narrative copy while the
         # canonical list stays honest (§22.5 hard contract).
         if self.politics.enabled:
+            from .distortion import distort_chronicle
             canon_start = len(report.events)
             # every active civ's successful adverse rolls join the chronicle,
             # whether they were carried on a legal snapshot or rolled for a
