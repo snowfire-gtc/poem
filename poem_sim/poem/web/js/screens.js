@@ -794,6 +794,13 @@
     const marketsData = s.markets || {};
     el.appendChild(h('h1', {}, '🏛 Двор'));
 
+    /* Кнопка вызова политического туториала (rules.md §9bis). */
+    if (window.openPoliticsTutorial) {
+      el.appendChild(h('div', { class: 'row' },
+        h('button', { class: 'secondary', text: '❓ Как устроен двор — туториал',
+          onclick: () => window.openPoliticsTutorial(0) })));
+    }
+
     if (elitesData.politics_enabled === false && rulerData.politics_enabled === false) {
       el.appendChild(h('div', { class: 'banner warn' },
         'Политический слой в этом мире выключен (politics.enabled=false) — двора, элит и рынков сбыта нет.'));

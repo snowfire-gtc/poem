@@ -203,6 +203,12 @@
        чисел лояльности/оби/амбиций и сырых бросков эти маршруты не отдают;
        аудит скрытых значений — отдельный admin-only raw endpoint. */
     elites() { return this.get(`/worlds/${this.worldId}/elites`); }
+    /* Флаг политического слоя мира (для автопоказа туториала §9bis):
+       enough — ответ `/ruler`, содержащий politics_enabled. */
+    async politicsEnabled() {
+      const r = await this.ruler();
+      return r.politics_enabled !== false;
+    }
     ruler(civId) {
       const q = civId ? `?civilization_id=${encodeURIComponent(civId)}` : '';
       return this.get(`/worlds/${this.worldId}/ruler${q}`);

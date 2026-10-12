@@ -225,6 +225,14 @@
       sidebar.appendChild(P.h('a', { href, dataset: { nav: href } },
         icon + ' ', P.h('span', { class: 'label', text: label })));
     }
+    /* Справка по политической системе Rev 4 (rules.md §9bis) — туториал. */
+    const tutLink = P.h('a', { href: '#', class: 'muted', title: 'rules.md §9bis' },
+      '❓ ', P.h('span', { class: 'label', text: 'Туториал' }));
+    tutLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (window.openPoliticsTutorial) window.openPoliticsTutorial(0);
+    });
+    sidebar.appendChild(tutLink);
     sidebar.appendChild(P.h('a', { href: '#/login', class: 'muted' },
       '🔑 ', P.h('span', { class: 'label', text: 'Сессия' })));
 
@@ -409,6 +417,12 @@
     // Роль — по проверке учётных данных на сервере (§15), затем перестроить
     // сайдбар (админ-разделы появляются только для admin).
     api.probe().then(() => { if (shellEl) buildShell(); }).catch(() => {});
+    /* Автопоказ политического туториала один раз за браузер-профиль,
+       если мир включает слой Rev 4 (§9bis; UI-флаг в localStorage —
+       это настройка интерфейса, не игровые данные). */
+    api.politicsEnabled().then((on) => {
+      if (on && window.maybeShowPoliticsTutorial) window.maybeShowPoliticsTutorial();
+    }).catch(() => {});
     if ((location.hash || '#/').startsWith('#/login') || !location.hash) {
       location.hash = '#/dashboard';
     } else {

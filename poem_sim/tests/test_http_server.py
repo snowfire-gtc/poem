@@ -122,3 +122,20 @@ def test_cli_refuses_open_server_without_token(monkeypatch):
     monkeypatch.delenv("POEM_ALLOW_OPEN_SERVER", raising=False)
     with pytest.raises(SystemExit):
         main(["--port", "0"])   # argparse.error → SystemExit(2)
+
+
+def _raw_get(base, path):
+    req = urllib.request.Request(base + path)
+    with urllib.request.urlopen(req) as resp:
+        return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+
+
+def test_static_bundle_serves_tutorial_and_index_links_it(server):
+    """Rev 4 §9bis: туториал политической системы отдаётся тем же origin."""
+    status, ctype, body = _raw_get(server, "/js/tutorial.js")
+    assert status == 200
+    assert "javascript" in ctype and "utf-8" in ctype
+    assert b"openPoliticsTutorial" in body
+    status, ctype, html = _raw_get(server, "/")
+    assert status == 200 and ctype.startswith("text/html")
+    assert b"/js/tutorial.js" in html
