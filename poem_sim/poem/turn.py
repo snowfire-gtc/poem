@@ -110,6 +110,10 @@ class TurnReport:
     conspiracies: list[dict] = field(default_factory=list)        # chronicle facts
     rulers: list[dict] = field(default_factory=list)              # public bands
     narrative_distortion: dict = field(default_factory=dict)      # §22.6 step 19a audit
+    # --- TASK-074 (§22.4): market layer public projections. Empty while
+    # politics is disabled — Rev-3 byte identity holds (§22.9-3).
+    markets: list[dict] = field(default_factory=list)             # saturation bands, exporters
+    influence: list[dict] = field(default_factory=list)           # dominant/presence band
     # server-side ONLY (admin raw endpoint): hidden rolls & audits per civ
     hidden_audit: dict = field(default_factory=dict)
 
@@ -157,6 +161,11 @@ class TurnEngine:
         # snapshot this turn — they still strike (§22.1), so their raw rolls
         # are kept here for the admin audit / chronicle projection.
         self._orphan_fortune_rolls: list = []
+        # Rev 4 TASK-074 (§22.4): market/niche and influence layer. Created
+        # lazily on the first turn with politics enabled; while disabled the
+        # engine never touches them (Rev-3 identity, §22.9-3).
+        self.niche_map: dict = {}
+        self.influence_regions: dict = {}
         # last finalized TurnReport (Rev 4 audit consumers: admin endpoint)
         self.last_report: "TurnReport | None" = None
         # Folklore corpus (§11.5): spread/mutation scale with GAME time only.
@@ -719,7 +728,13 @@ class TurnEngine:
         # time (§5.1 preview = charge). We record them here for step 17a's
         # tax-pressure proxy.
         politics_out: dict = {}
+        markets_out: dict = {}
         if self.politics.enabled:
+            # --- Rev 4 step 16a (§22.4, TASK-074): markets & niches run
+            # BEFORE the elite step so this turn's market_grievance feeds
+            # faction grievance in 17a; all rolls come from WorldRng and
+            # stay server-side (hidden AI bids, §22.8).
+            markets_out = self._run_markets_step(turn, span, economy)
             charged: dict[str, list[float]] = {}
             for snap in self._snapshot_list:
                 for rev in snap.pending_amendments + snap.pending_repeals:
@@ -731,7 +746,10 @@ class TurnEngine:
                     if c > 0.0:
                         charged.setdefault(snap.civilization_id, []).append(c)
             self._charged_costs_by_civ = charged
-            politics_out = self._run_politics_step(turn, span, economy)
+            # this turn's market losses feed faction grievance in 17a (§22.4-1)
+            politics_out = self._run_politics_step(
+                turn, span, economy,
+                market_grievances=markets_out.get("grievances", {}))
 
         # TASK-068 (§ language design): advance the koine/dialect tree.
         # Drift, road growth and unification all scale with the turn's
@@ -853,10 +871,17 @@ class TurnEngine:
                           if self.politics.enabled else []),
             rulers=(politics_out.get("public", {}).get("rulers", [])
                     if self.politics.enabled else []),
+            markets=(markets_out.get("public", [])
+                     if self.politics.enabled else []),
+            influence=([r.to_public_json()
+                        for r in self.influence_regions.values()]
+                       if self.politics.enabled else []),
             hidden_audit={
                 "charged_costs": {cid: sum(v) for cid, v in
                                   self._charged_costs_by_civ.items()},
                 **({
+                    "market_bids": markets_out.get("hidden", {}).get("bids", {}),
+                    "market_grievances": markets_out.get("grievances", {}),
                     "elite_deltas": politics_out.get("hidden", {}).get("elite_deltas", {}),
                     "conspiracy_audit": politics_out.get("hidden", {}).get("conspiracy_audit", {}),
                     "successions": politics_out.get("hidden", {}).get("successions", []),
@@ -972,6 +997,10 @@ class TurnEngine:
                 "elites": report.elites,
                 "conspiracies": report.conspiracies,
                 "rulers": report.rulers,
+                # §22.4/§22.8: bands and exporter names only — rival bids
+                # never leave the server (hidden_audit["market_bids"]).
+                "markets": report.markets,
+                "influence": report.influence,
             }
 
         # §13 step 22: wrap the published numbers into the ruler's literary
@@ -1027,8 +1056,135 @@ class TurnEngine:
 
     # ------------------------------------------------------------- internals
 
+    def _run_markets_step(self, turn: Turn, span: SimDuration,
+                          economy: dict) -> dict:
+        """Rev 4 step 16a (§22.4, TASK-074): markets, niches, influence fields.
+
+        Runs BEFORE the elite step so this turn's market losses can feed
+        faction grievance in 17a. Every draw comes from ``WorldRng`` keyed
+        by (seed, turn number, niche, civ) — same seed & history ⇒ same
+        market shifts (§22.9-8/10). Rival bids stay server-side; only
+        saturation bands and exporter names are projected publicly (§22.8).
+
+        State lives on the engine (``niche_map``, ``influence_regions``,
+        ``_internal_rulers``) and persists between turns exactly like the
+        rest of the canonical world state.
+        """
+        from . import markets as MK
+        from .chronology import risk_premium_value
+
+        if not self.niche_map:
+            self.niche_map = MK.build_default_niche_map()
+            self.influence_regions = MK.build_influence_map()
+        if not hasattr(self, "_treaties"):
+            self._treaties: dict[tuple[str, str], float] = {}
+
+        active_ids = sorted(cid for cid, c in self.civilizations.items()
+                            if c.active)
+        # --- internal rulers (§22.4 preamble): derived from public RulerState
+        rulers: dict[str, MK.InternalRuler] = {}
+        for cid in active_ids:
+            civ = self.civilizations[cid]
+            cap = max(0.05, civ.population / 1000.0 * (0.5 + civ.progress))
+            rulers[cid] = MK.make_internal_ruler(cid, civ.ruler, cap)
+        self._internal_rulers = rulers
+
+        # --- trade interest: sectors a civ exports into (§22.4-1). Derived
+        # deterministically from the economy profile: the strongest sectors
+        # above the mean share become that civ's export lanes.
+        from .elites import DEFAULT_ECONOMY_PROFILE
+        trade_interest: dict[str, list[str]] = {}
+        for cid in active_ids:
+            prof = {**DEFAULT_ECONOMY_PROFILE,
+                    **(self.civilizations[cid].economy_profile or {})}
+            mean = sum(prof.values()) / max(len(prof), 1)
+            strong = [s for s, w in sorted(prof.items()) if w > mean]
+            sectors = []
+            for lane in strong:
+                if "agri" in lane or "land" in lane:
+                    sectors += ["grain"]
+                elif lane == "trade":
+                    sectors += ["textiles", "spices"]
+                elif lane == "craft":
+                    sectors += ["textiles", "metals"]
+                elif "military" in lane:
+                    sectors += ["horse", "metals"]
+                elif lane in ("religion", "administration", "writing"):
+                    sectors += ["timber"]      # scriptoria, temples, shipyards
+            trade_interest[cid] = sorted(set(sectors)) or ["grain"]
+
+        # --- risk premiums (§22.3 formula, same inputs as step 6): the dearer
+        # doing business feels, the lower the stakes rivals carry into it.
+        eq = self.politics.equilibrium
+        risk_premiums = {cid: risk_premium_value(
+            self.civilizations[cid].stability_years, eq.risk_base, eq.tau_law)
+            for cid in active_ids}
+
+        out = MK.resolve_markets(self.rng, turn.number, self.niche_map,
+                                 rulers, trade_interest, risk_premiums)
+
+        # --- first-mover entry (§22.4-2): every exporter with an admin budget
+        # may buy its way into a free niche; cost grows geometrically with
+        # saturation, so a hesitating player pays the full risk price later.
+        entries: list[dict] = []
+        for cid in active_ids:
+            civ = self.civilizations[cid]
+            for niche_id, niche in sorted(self.niche_map.items()):
+                if niche.sector not in trade_interest[cid]:
+                    continue
+                if cid in niche.entrants or not niche.is_open():
+                    continue
+                cost = niche.entry_cost(risk_premiums[cid])
+                if civ.administrative_budget >= cost:
+                    civ.administrative_budget -= cost
+                    niche.entrants[cid] = max(
+                        0.05, civ.population / 1000.0 * (0.5 + civ.progress))
+                    entries.append({"civ": cid, "niche": niche_id,
+                                    "cost": round(cost, 3)})
+
+        # --- influence field drift (§22.4-3): slow presence growth, treaties
+        # and folklore export nudge neighbours' fields. No instant conquests.
+        treaties = [(a, b) for a, b in self._active_treaty_pairs(active_ids)]
+        folklore_export: dict[str, float] = {}
+        for item in self.folklore[-12:]:
+            owner = getattr(item, "owner_civ_id", None) or \
+                getattr(item, "civilization_id", None)
+            if owner in active_ids:
+                folklore_export[owner] = (folklore_export.get(owner, 0.0) + 1.0)
+        MK.update_influence(self.influence_regions, active_ids, span.years,
+                            treaties, folklore_export)
+
+        # --- diplomacy with character (§22.4-4): ONE hidden break roll per
+        # treaty per turn; tyrants break their word more often.
+        broken = []
+        for pair in treaties:
+            fact = MK.maybe_break_treaty(self.rng, turn.number, pair, rulers)
+            if fact is not None:
+                self._treaties.pop(tuple(sorted(pair)), None)
+                broken.append(fact)
+
+        return {"shifts": out["shifts"], "public": out["public"],
+                "hidden": out["hidden"], "grievances": out["grievances"],
+                "entries": entries, "broken_treaties": broken}
+
+    def _active_treaty_pairs(self, active_ids: list[str]):
+        """Treaty registry (§22.4-3): bonds of long presence, formed
+        deterministically between consecutive active civilizations and kept
+        on the engine until one side breaks its word (§22.4-4) or dies out.
+        No scripts, no player API — only game-time facts."""
+        reg = self._treaties
+        for k in [k for k in reg if not all(c in active_ids for c in k)]:
+            reg.pop(k, None)                     # dead civ voids its treaties
+        ids = list(active_ids)
+        for i in range(0, len(ids) - 1, 2):
+            a, b = sorted((ids[i], ids[i + 1]))
+            reg.setdefault((a, b), 0.0)
+        return list(reg)
+
     def _run_politics_step(self, turn: Turn, span: SimDuration,
-                           economy: dict) -> dict:
+                           economy: dict,
+                           market_grievances: dict[str, float] | None = None
+                           ) -> dict:
         """Rev 4 steps 17a/17b (§22.2–22.3): elites → conspiracy → equilibrium.
 
         Returns a bundle consumed by the TurnReport (public projections +
@@ -1068,6 +1224,14 @@ class TurnEngine:
             civ.tax_load = max(civ.tax_load, load_now)   # shocks spike it now
             deltas = EL.update_factions(factions, civ.ruler, span.years,
                                         civ.tax_load, cfg)
+            # §22.4-1: rivals that lost market shares this turn carry the
+            # loss into their grievance — trade orders feel it most.
+            if market_grievances:
+                mg = market_grievances.get(civ_id, 0.0)
+                if mg > 0.0:
+                    for f in factions:
+                        bump = mg * 0.05 * (1.6 if f.name == "merchants" else 1.0)
+                        f.grievance = min(1.0, f.grievance + bump)
             hidden["elite_deltas"][civ_id] = deltas
 
             # cruelty decays slowly; fresh cruelty still protects the throne
