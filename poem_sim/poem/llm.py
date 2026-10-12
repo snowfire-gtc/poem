@@ -57,7 +57,7 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 ENV_PREFIX = "POEM_LLM"
 

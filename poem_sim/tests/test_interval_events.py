@@ -26,7 +26,6 @@ from poem.core import (
     Law,
     LawUserAction,
     SimDuration,
-    TimedEffect,
     TimedEffectKind,
     Treaty,
 )
@@ -50,8 +49,8 @@ def make_engine(progress: float):
 
 def test_short_turn_generates_no_milestones():
     """A 2-year modern turn is too short to fabricate intermediate events."""
-    from poem.turn import TurnReport
     from poem.core import Era
+    from poem.turn import TurnReport
 
     report = TurnReport(
         turn_id="t", turn_number=1, era_before=Era.MODERN, era_after=Era.MODERN,
@@ -62,8 +61,8 @@ def test_short_turn_generates_no_milestones():
 
 def test_ancient_40y_turn_gets_cultural_milestone():
     """A 40-year ancient turn yields evenly spaced chronicle milestones."""
-    from poem.turn import TurnReport
     from poem.core import Era
+    from poem.turn import TurnReport
 
     report = TurnReport(
         turn_id="t", turn_number=1, era_before=Era.ANCIENT, era_after=Era.ANCIENT,

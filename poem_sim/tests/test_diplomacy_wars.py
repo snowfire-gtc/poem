@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from poem.chronology import Civilization, WorldChronology
-from poem.core import SimDuration, TimedEffect, TimedEffectKind, Treaty, War
+from poem.core import SimDuration, TimedEffectKind, Treaty, War
 from poem.laws import LawStore
 from poem.turn import TurnEngine
 

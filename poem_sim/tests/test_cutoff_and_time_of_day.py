@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import sys
-
-import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,7 +14,6 @@ from poem.chronology import Civilization, WorldChronology
 from poem.core import (
     CanonicalLaw,
     CanonicalLawChange,
-    DraftStatus,
     Law,
     LawStatus,
     LawUserAction,

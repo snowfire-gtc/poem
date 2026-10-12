@@ -39,7 +39,6 @@ import json
 import mimetypes
 import os
 import sys
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 

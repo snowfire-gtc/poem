@@ -8,8 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from poem.chronology import (
-    Civilization,
     ChronologyConfigError,
+    Civilization,
     WorldChronology,
     advance_chronology,
     calculate_turn_span,
@@ -19,7 +19,14 @@ from poem.chronology import (
     tradition_gain,
     validate_chronology_config,
 )
-from poem.core import Era, EraSource, GameSpeed, SimDuration, TimedEffect, TimedEffectKind
+from poem.core import (
+    Era,
+    EraSource,
+    GameSpeed,
+    SimDuration,
+    TimedEffect,
+    TimedEffectKind,
+)
 
 
 def classical_world(speed=GameSpeed.STANDARD, era_source=EraSource.MEDIAN_ACTIVE_CIVILIZATIONS):
@@ -209,13 +216,12 @@ def test_validation_rejects_nonpositive_values():
 
 def _run_one_turn(progress: float):
     """Open a turn in an era determined by `progress`, run it, return report."""
-    from datetime import timezone as _tz
     from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
-    from poem.core import CanonicalLaw, Law
+    from poem.core import CanonicalLaw, FolkloreItem, Law
     from poem.laws import LawStore
     from poem.turn import TurnEngine
-    from poem.core import FolkloreItem
 
     day = _dt(2026, 10, 10, tzinfo=_tz.utc)
     store = LawStore()
@@ -346,7 +352,7 @@ def test_long_night_season_survives_turn_ticks():
     """A world configured with the LONG_NIGHT season (§15.4 sample) must keep
     its own cycle when chronology advances, instead of collapsing to spring."""
     from poem.chronology import advance_chronology, season_cycle_for
-    from poem.core import SeasonId, SimDuration
+    from poem.core import SeasonId
 
     ch = WorldChronology("w1")
     ch.current_season = SeasonId.LONG_NIGHT

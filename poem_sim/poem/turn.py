@@ -36,21 +36,20 @@ from .core import (
     CustomaryLaw,
     Era,
     FolkloreItem,
-    Law,
     LawConflict,
-    Prejudice,
     LawRevision,
     LawRevisionStatus,
     LawStatus,
     LawUserAction,
+    Prejudice,
     SimDuration,
     TimedEffect,
     TimedEffectKind,
     Treaty,
-    War,
     Turn,
     TurnLawSnapshot,
     TurnStatus,
+    War,
     utcnow,
 )
 from .laws import LawStore
@@ -140,7 +139,8 @@ class TurnEngine:
         self.timed_effects: list[TimedEffect] = timed_effects or []
         # Rev 4 (§22): political layer. Default OFF ⇒ every R4 hook below is
         # a no-op and the engine behaves exactly like Rev 3 (hard rule).
-        from .politics import PoliticsConfig as _PC, WorldRng as _WR
+        from .politics import PoliticsConfig as _PC
+        from .politics import WorldRng as _WR
         self.politics = politics if isinstance(politics, _PC) else _PC()
         self.rng = _WR(world_seed, world_id)
         # faction registry per civilization (created lazily on first turn
@@ -265,7 +265,7 @@ class TurnEngine:
         self._superseded_list = []
 
         snapshots: list[TurnLawSnapshot] = []
-        civ_ids = sorted({l.civilization_id for l in self.store._laws.values()})
+        civ_ids = sorted({law.civilization_id for law in self.store._laws.values()})
 
         # Partition pending revisions against the cutoff and determine the
         # per-law winner BEFORE touching any law state: a suspension that is
@@ -455,8 +455,8 @@ class TurnEngine:
                 if civ is None or not civ.active or civ.id in rolled_for:
                     continue
                 rolled_for.add(civ.id)
-                kinds = {l.canonical.kind for l in snap.active_laws
-                        if l.canonical is not None}
+                kinds = {law.canonical.kind for law in snap.active_laws
+                        if law.canonical is not None}
                 statecraft = civ.ruler.statecraft if civ.ruler else 0.0
                 rolls, impacts = roll_fortune(
                     self.rng, turn.number, civ.id, statecraft, kinds,
@@ -893,8 +893,7 @@ class TurnEngine:
         # §19.1: build the turn chronicle ("events for the interval") BEFORE
         # the view, so clients receive intermediate cultural milestones and
         # key events instead of a bare time jump.
-        from .views import (
-            build_turn_view, interval_events, queue_image_tasks)
+        from .views import build_turn_view, interval_events, queue_image_tasks
 
         report.events = [e.to_json() for e in
                          interval_events(report, turn.world_year_before)]
@@ -1206,7 +1205,6 @@ class TurnEngine:
         same laws, same spans ⇒ same rolls and successions (§22.9-1).
         """
         from . import elites as EL
-        from .distortion import distort_chronicle
 
         cfg = self.politics
         year = self.chronology.current_year

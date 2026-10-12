@@ -430,7 +430,7 @@ def _build_sections(view: dict, civ_id: str, report: dict,
 
     # --- lawcraft ------------------------------------------------------------
     applied = set(report.get("applied_revisions", []))
-    laws_by_id = {l.get("id"): l for l in view.get("laws", [])}
+    laws_by_id = {lw.get("id"): lw for lw in view.get("laws", [])}
     for rev in report.get("_revisions_meta", []):
         rid = rev.get("revision_id")
         if rid not in applied:

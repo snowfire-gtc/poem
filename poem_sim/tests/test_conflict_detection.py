@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from poem.api import WorldServer
 from poem.chronology import Civilization, WorldChronology
-from poem.core import CanonicalLaw, CanonicalLawChange, Law, LawStatus, LawUserAction
+from poem.core import CanonicalLaw, CanonicalLawChange, Law, LawUserAction
 from poem.laws import LawStore
 from poem.pricing import PricingConfig, cost_of_law_change
 from poem.turn import TurnEngine
@@ -111,7 +111,7 @@ def test_conflicts_are_evaluated_against_the_final_post_repeal_set():
     snap = next(s for s in snaps if s.civilization_id == "c1")
 
     # law-tax is repealed this turn => not in active_laws anymore
-    assert "law-tax" not in [l.id for l in snap.active_laws]
+    assert "law-tax" not in [law.id for law in snap.active_laws]
     # the census amendment therefore has no same-kind/opposed partner left
     census_clashes = [c for c in snap.conflicts if c.law_a == "law-census"]
     assert census_clashes == []

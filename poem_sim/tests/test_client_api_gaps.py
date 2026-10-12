@@ -40,7 +40,7 @@ def test_laws_list_filters_by_query_string():
     srv = _server()
     res = srv.handle("GET", "/api/v1/laws?civilization_id=c1")
     assert res["status"] == 200
-    ids = [l["id"] for l in res["laws"]]
+    ids = [lw["id"] for lw in res["laws"]]
     assert ids == ["l1"], f"filter must leave only c1 laws, got {ids}"
 
     all_res = srv.handle("GET", "/api/v1/laws")

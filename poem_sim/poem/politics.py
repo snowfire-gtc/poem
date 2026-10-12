@@ -19,9 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import tomllib
-from dataclasses import dataclass, field, fields, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Seedable deterministic PRNG (§22.1 rule 1)

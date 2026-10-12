@@ -37,7 +37,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-
 #: Sectors that can host an export niche (§22.4). Deterministic order —
 #: iteration over this tuple defines slot indices, never reorder lightly.
 NICHE_SECTORS: tuple[str, ...] = (

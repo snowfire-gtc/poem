@@ -232,7 +232,7 @@ def build_map_view(server, civ_id: str | None = None) -> dict:
     koine = lang.koine(civ_id)
     own_settlements = [s for s in lang.settlements if s.civilization_id == civ_id]
     other_settlements = [s for s in lang.settlements if s.civilization_id != civ_id]
-    own_laws = [l for l in server.store._laws.values() if l.civilization_id == civ_id]
+    own_laws = [law for law in server.store._laws.values() if law.civilization_id == civ_id]
 
     report = (server.published_reports[-1] if server.published_reports else {})
     view = report.get("view") or {}
