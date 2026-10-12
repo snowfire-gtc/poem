@@ -16,6 +16,7 @@
     chronology: null, report: null, schedule: null,
     laws: null, pending: null, snapshot: null, drafts: null,
     images: null, metrics: null, tokens: null, map: null,
+    elites: null, ruler: null, markets: null, rawAudit: null,
     lawDetail: {},                              // law_id -> GET /laws/{id}
   };
 
@@ -33,6 +34,7 @@
     ['draft',      /^\/drafts\/([^/]+)$/,          'DraftEditorScreen'],
     ['pending',    /^\/pending$/,                  'PendingScreen'],
     ['diplomacy',  /^\/diplomacy$/,                'DiplomacyScreen'],
+    ['court',      /^\/court$/,                    'CourtScreen'],
     ['map',        /^\/map$/,                    'MapScreen'],
     ['gallery',    /^\/gallery$/,                  'GalleryScreen'],
     ['adminQueue', /^\/admin\/queue$/,             'AdminQueueScreen'],
@@ -100,6 +102,25 @@
   async function refreshMetrics() { store.metrics = await api.imageMetrics(); }
   async function refreshTokens() { store.tokens = await api.tokens(); }
 
+  /* Rev 4 (§22.8): политические проекции — полосы и факты. Отдельные
+     маршруты elites/ruler/markets дают «живое» состояние между ходами;
+     report.view.politics — снимок последнего хода (метки narrative). */
+  async function refreshPolitics() {
+    const results = await Promise.allSettled([
+      api.elites(), api.ruler(store.sessionCiv || undefined), api.markets(),
+    ]);
+    store.elites = results[0].status === 'fulfilled' ? results[0].value : store.elites;
+    store.ruler = results[1].status === 'fulfilled' ? results[1].value : store.ruler;
+    store.markets = results[2].status === 'fulfilled' ? results[2].value : store.markets;
+  }
+
+  /* Admin-only аудит скрытых бросков (§22.8): сырые значения приходят
+     ТОЛЬКО сюда, с учётным токеном; для игрока экран их не запрашивает. */
+  async function refreshRawAudit(turnNumber) {
+    if (api.role !== 'admin') { store.rawAudit = null; return; }
+    store.rawAudit = await api.adminRawTurn(turnNumber);
+  }
+
   /* Карта — по запросу экрана (не поллится): серверная призма знаний
      цивилизации + проекция из localStorage клиента (ui-client.md §2.11). */
   window.refreshMap = async function () {
@@ -140,6 +161,14 @@
     try { await refreshTokens(); } catch (e) {}
     rerender();
   };
+  window.refreshPolitics = async function () {
+    try { await refreshPolitics(); } catch (e) {}
+    rerender();
+  };
+  window.refreshRawAudit = async function (turnNumber) {
+    try { await refreshRawAudit(turnNumber); } catch (e) {}
+    rerender();
+  };
 
   /* ------------------------------- layout ------------------------------- */
   const NAV = [
@@ -149,6 +178,7 @@
     ['#/drafts',     '✍', 'Черновики'],
     ['#/pending',    '🗂', 'Правки'],
     ['#/diplomacy',  '🤝', 'Диплом.'],
+    ['#/court',      '🏛', 'Двор'],
     ['#/map',        '🗺', 'Карта'],
     ['#/gallery',    '🖼', 'Галерея'],
   ];
@@ -195,6 +225,14 @@
       sidebar.appendChild(P.h('a', { href, dataset: { nav: href } },
         icon + ' ', P.h('span', { class: 'label', text: label })));
     }
+    /* Справка по политической системе Rev 4 (rules.md §9bis) — туториал. */
+    const tutLink = P.h('a', { href: '#', class: 'muted', title: 'rules.md §9bis' },
+      '❓ ', P.h('span', { class: 'label', text: 'Туториал' }));
+    tutLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (window.openPoliticsTutorial) window.openPoliticsTutorial(0);
+    });
+    sidebar.appendChild(tutLink);
     sidebar.appendChild(P.h('a', { href: '#/login', class: 'muted' },
       '🔑 ', P.h('span', { class: 'label', text: 'Сессия' })));
 
@@ -265,10 +303,11 @@
     DraftEditorScreen: async () => {},           // сам тянет черновик (editor state)
     PendingScreen:    async () => { await refreshPendingBundles(); },
     DiplomacyScreen:  async () => { await refreshReport(); },
+    CourtScreen:      async () => { await Promise.allSettled([refreshPolitics(), refreshReport()]); },
     MapScreen:        async () => { await Promise.allSettled([refreshChronology(), refreshMap()]); },
     GalleryScreen:    async () => { await refreshImages(); },
     AdminQueueScreen: async () => { await refreshMetrics(); },
-    AdminWorldScreen: async () => { await Promise.allSettled([refreshChronology(), refreshTokens()]); },
+    AdminWorldScreen: async () => { await Promise.allSettled([refreshChronology(), refreshTokens(), refreshRawAudit()]); },
     LoginScreen:      async () => {},
   };
 
@@ -378,6 +417,12 @@
     // Роль — по проверке учётных данных на сервере (§15), затем перестроить
     // сайдбар (админ-разделы появляются только для admin).
     api.probe().then(() => { if (shellEl) buildShell(); }).catch(() => {});
+    /* Автопоказ политического туториала один раз за браузер-профиль,
+       если мир включает слой Rev 4 (§9bis; UI-флаг в localStorage —
+       это настройка интерфейса, не игровые данные). */
+    api.politicsEnabled().then((on) => {
+      if (on && window.maybeShowPoliticsTutorial) window.maybeShowPoliticsTutorial();
+    }).catch(() => {});
     if ((location.hash || '#/').startsWith('#/login') || !location.hash) {
       location.hash = '#/dashboard';
     } else {

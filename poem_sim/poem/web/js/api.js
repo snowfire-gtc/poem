@@ -199,6 +199,29 @@
     }
     openTurn(body) { return this.mutate('POST', `/worlds/${this.worldId}/turns/open`, body); }
     runTurn(body) { return this.mutate('POST', `/worlds/${this.worldId}/turns/run`, body); }
+    /* Rev 4 (§22.8): политические проекции — ТОЛЬКО полосы и факты. Точных
+       чисел лояльности/оби/амбиций и сырых бросков эти маршруты не отдают;
+       аудит скрытых значений — отдельный admin-only raw endpoint. */
+    elites() { return this.get(`/worlds/${this.worldId}/elites`); }
+    /* Флаг политического слоя мира (для автопоказа туториала §9bis):
+       enough — ответ `/ruler`, содержащий politics_enabled. */
+    async politicsEnabled() {
+      const r = await this.ruler();
+      return r.politics_enabled !== false;
+    }
+    ruler(civId) {
+      const q = civId ? `?civilization_id=${encodeURIComponent(civId)}` : '';
+      return this.get(`/worlds/${this.worldId}/ruler${q}`);
+    }
+    markets() { return this.get(`/worlds/${this.worldId}/markets`); }
+    adminRawTurn(turnNumber) {
+      /* Сервер хранит raw-снимок только последнего завершённого хода
+         (§22.8): «turns/last/raw» и «turns/{n}/raw» без turn_number —
+         один и тот же маршрут; номер передаётся query, если известен. */
+      const seg = turnNumber != null ? encodeURIComponent(turnNumber) : 'last';
+      const q = turnNumber != null ? `?turn_number=${encodeURIComponent(turnNumber)}` : '';
+      return this.get(`/admin/worlds/${this.worldId}/turns/${seg}/raw${q}`);
+    }
 
     /* Asset as <img> src: binary route first, JSON base64 envelope fallback. */
     assetUrl(taskId) { return `${BASE}/images/${encodeURIComponent(taskId)}/asset`; }

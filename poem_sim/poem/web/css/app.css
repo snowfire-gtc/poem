@@ -241,6 +241,23 @@ table.laws tr:hover td { background: var(--panel-2); }
 .chip { display: inline-block; background: var(--panel-2); border: 1px solid var(--line);
         border-radius: 999px; padding: 2px 10px; font-size: 12px; margin: 2px 4px 2px 0; }
 
+/* ------------------------- Двор / слои правды (Rev 4, §22.5/§22.8) ------- */
+.b-narrative { background: rgba(180,142,173,.16); color: #cbaab8; border-color: #7d5a75; }
+.b-canonical { background: rgba(63,168,160,.16);  color: #6fd0c9; border-color: #2e7a74; }
+.ruler-card { border-left: 4px solid var(--accent); }
+.chip.band-high   { border-color: #4c7a3a; color: #8fce72; }
+.chip.band-medium { border-color: #8a6d1f; color: #e3c05c; }
+.chip.band-low    { border-color: #55606a; color: var(--muted); }
+.chip.pos-disaffected { border-color: #8a3a2e; color: #e08a7c; }
+.chip.pos-loyal       { border-color: #2e7a74; color: #6fd0c9; }
+.chip.pos-watchful    { border-color: #35647f; color: #7db7de; }
+.chip.sat-open      { border-color: #4c7a3a; color: #8fce72; }
+.chip.sat-contested { border-color: #8a5222; color: #e6a76d; }
+.chip.sat-crowded   { border-color: #8a3a2e; color: #e08a7c; }
+.chip.inf-strong { border-color: #4c7a3a; color: #8fce72; }
+.chip.inf-weak   { border-color: #8a6d1f; color: #e3c05c; }
+.chip.inf-unsettled { border-color: #55606a; color: var(--muted); }
+
 /* ------------------------------ Карта (§2.11) ---------------------------- */
 .map-grid { display:flex; flex-direction:column; gap:2px; overflow-x:auto; }
 .map-row { display:flex; gap:2px; }
@@ -256,3 +273,18 @@ table.laws tr:hover td { background: var(--panel-2); }
 .map-cell.unknown { background:rgba(120,120,140,.08); border:1px dotted var(--muted); color:var(--muted); }
 .legend.k-known { color:#4ba892; } .legend.k-dim { color:#c98a2d; } .legend.k-unknown { color:var(--muted); }
 .map-lore li { margin:4px 0; }
+
+/* ------------------- Туториал Rev 4 (rules.md §9bis) --------------------- */
+.tut-overlay { position: fixed; inset: 0; z-index: 60; display: flex;
+  align-items: center; justify-content: center; padding: 18px;
+  background: rgba(8, 10, 14, .62); }
+.tut-modal { max-width: 640px; width: 100%; max-height: 82vh; overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+.tut-head { display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; margin-bottom: 6px; font-size: 15px; }
+.tut-chapter h3 { margin: 12px 0 8px; }
+.tut-body { font-family: var(--serif); white-space: pre-wrap; line-height: 1.55;
+  background: var(--parchment); color: var(--parchment-ink);
+  border: 1px solid #cbb98d; border-radius: 8px; padding: 12px 14px;
+  margin: 0 0 8px; font-size: 14px; }
+.tut-modal .row { align-items: center; margin-top: 10px; }

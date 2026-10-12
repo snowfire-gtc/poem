@@ -935,10 +935,15 @@ class WorldServer:
         dao_balance and self_deception are server-side secrets (§22.5).
         ``public_virtues`` is the one rounded figure the court advertises.
         """
+        # Без явной цивилизации отдаём первую из реестра — клиент-«тонкий
+        # слой» может не иметь выбранной сессии (экран «Двор» до выбора civ).
         civ_id = body.get("civilization_id") or ""
+        if not civ_id and self.civilizations:
+            civ_id = next(iter(self.civilizations))
         civ = self.civilizations.get(civ_id)
         if civ is None:
-            raise ValueError(f"unknown civilization {civ_id!r}")
+            return {"civilization_id": civ_id, "ruler": None,
+                    "politics_enabled": self.engine.politics.enabled}
         r = civ.ruler
         if r is None:
             return {"civilization_id": civ_id, "ruler": None,
@@ -1487,8 +1492,10 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
                  "asset", "civilizations", "cost_preview", "metrics", "validate",
                  "tokens", "condition", "map", "settlements", "language",
                  # Rev 4 (§22.8): политические коллекции и admin raw-аудит —
-                 # literal-сегменты, не сворачиваются в {id}
-                 "elites", "ruler", "markets", "admin", "raw"}
+                 # literal-сегменты, не сворачиваются в {id}. "last" тоже
+                 # literal: клиент шлёт turns/last/raw когда номер хода ему
+                 # неизвестен (экран «Двор» обновляет аудит до первого рунда).
+                 "elites", "ruler", "markets", "admin", "raw", "last"}
     if token in known_ids:
         return False
     prev = parts[index - 1] if index else ""
@@ -1497,6 +1504,12 @@ def _looks_like_id(token: str, parts: list[str], index: int) -> bool:
     # {id}; only a real id after "drafts" (d42) collapses.
     if token == "drafts" and prev == "laws":
         return False
+    # Special case (§22.8): admin raw-аудит — любой сегмент между "turns" и
+    # финальным literal "raw" это номер хода ({n}), а не id мира: путь
+    # /admin/worlds/{id}/turns/{n}/raw должен сворачиваться симметрично
+    # клиентскому /turns/last/raw (оба матчатся одним шаблоном маршрута).
+    if prev == "turns" and index + 1 < len(parts) and parts[index + 1] == "raw":
+        return True
     if prev in {"laws", "drafts", "revisions", "worlds", "treaties", "images",
                 "tokens"}:
         return True
@@ -1612,6 +1625,11 @@ _ROUTE_TABLE = [
     ("GET", r"^/api/v1/worlds/\{id\}/ruler$", WorldServer.get_ruler),
     ("GET", r"^/api/v1/worlds/\{id\}/markets$", WorldServer.get_markets),
     ("GET", r"^/api/v1/admin/worlds/\{id\}/turns/\{id\}/raw$",
+     WorldServer.get_admin_raw_turn),
+    # Клиентский вариант «последний ход»: turns/last/raw (номер хода клиенту
+    # может быть неизвестен — экран «Двор» открывает аудит до первого рунда).
+    # "last" не сворачивается в {id} (_looks_like_id), поэтому маршрут отдельный.
+    ("GET", r"^/api/v1/admin/worlds/\{id\}/turns/last/raw$",
      WorldServer.get_admin_raw_turn),
     ("GET", r"^/api/v1/admin/worlds/\{id\}/turns/raw$",
      WorldServer.get_admin_raw_turn),
