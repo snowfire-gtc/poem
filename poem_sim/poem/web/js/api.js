@@ -23,6 +23,7 @@
       this.worldId = localStorage.getItem('poem.world') || 'world';
       this.civId = localStorage.getItem('poem.civ') || '';
       this.online = navigator.onLine !== false;
+      this._role = localStorage.getItem('poem.role') || '';
       this._inflight = new Map();          // key -> Promise (dedup)
       this._queue = [];                    // offline mutation retries
       this._retrying = false;
@@ -37,7 +38,25 @@
       if ('world' in s) { this.worldId = s.world || 'world'; persist('poem.world', this.worldId); }
       if ('civ' in s) { this.civId = s.civ || ''; persist('poem.civ', this.civId); }
     }
-    get role() { return this.token ? 'admin' : 'player'; }
+    /* Роль определяется проверкой учётных данных на сервере (§15), а не
+       эвристикой «токен есть/нет»: probe() вызывает GET /worlds/{id}/tokens
+       (только админ) и запоминает вывод. UI лишь скрывает разделы — реальные
+       права фильтрует сервер (ui-client.md §9). */
+    get role() { return this._role || 'player'; }
+    setRole(r) { this._role = r; persist('poem.role', r); }
+    async probe() {
+      if (!this.token) { this.setRole('player'); return 'player'; }
+      try {
+        await this.request('GET', `/worlds/${this.worldId}/tokens`);
+        this.setRole('admin');
+      } catch (e) {
+        // 401/403 — сервер отверг учётные данные: роль «игрок».
+        // Иначе (4xx валидации/5xx/сеть) токен принят обвязкой — считаем
+        // админом; юридически значимые решения всегда на сервере (§15).
+        this.setRole(e.status === 401 || e.status === 403 ? 'player' : 'admin');
+      }
+      return this._role;
+    }
 
     on(kind, fn) { this._listeners[kind].push(fn); }
     _emit(kind, data) { this._listeners[kind].forEach((f) => { try { f(data); } catch (e) {} }); }
@@ -169,6 +188,7 @@
     addTreaty(body) { return this.mutate('POST', `/treaties`, body); }
     declareWar(body) { return this.mutate('POST', `/wars`, body); }
     createCiv(body) { return this.mutate('POST', `/worlds/${this.worldId}/civilizations`, body); }
+    civilizations() { return this.get(`/worlds/${this.worldId}/civilizations`); }
     openTurn(body) { return this.mutate('POST', `/worlds/${this.worldId}/turns/open`, body); }
     runTurn(body) { return this.mutate('POST', `/worlds/${this.worldId}/turns/run`, body); }
 
