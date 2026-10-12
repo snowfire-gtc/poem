@@ -101,6 +101,17 @@ class TurnReport:
     ruler_reports: list[dict] = field(default_factory=list)  # §13 st.22 literary reports
     view: dict = field(default_factory=dict)                      # §13 step 19
     image_tasks: list[dict] = field(default_factory=list)         # §13 step 20
+    # --- Rev 4 (§22.6): political layer outputs -----------------------------
+    # politics_active=False ⇒ every field below stays empty/default and the
+    # report is byte-identical to a Rev-3 one (backward-compatibility rule).
+    politics_active: bool = False
+    fortune_events: list[dict] = field(default_factory=list)      # public, no rolls
+    elites: dict[str, list[dict]] = field(default_factory=dict)   # public bands only
+    conspiracies: list[dict] = field(default_factory=list)        # chronicle facts
+    rulers: list[dict] = field(default_factory=list)              # public bands
+    narrative_distortion: dict = field(default_factory=dict)      # §22.6 step 19a audit
+    # server-side ONLY (admin raw endpoint): hidden rolls & audits per civ
+    hidden_audit: dict = field(default_factory=dict)
 
 
 class TurnEngine:
@@ -114,6 +125,8 @@ class TurnEngine:
         civilizations: list[Civilization],
         pricing_cfg: PricingConfig | None = None,
         timed_effects: list[TimedEffect] | None = None,
+        politics=None,                      # poem.politics.PoliticsConfig | None
+        world_seed: int = 0,                # §22.1: server-side only, never shipped
     ) -> None:
         self.world_id = world_id
         self.store = store
@@ -121,6 +134,31 @@ class TurnEngine:
         self.civilizations = {c.id: c for c in civilizations}
         self.pricing_cfg = pricing_cfg or PricingConfig()
         self.timed_effects: list[TimedEffect] = timed_effects or []
+        # Rev 4 (§22): political layer. Default OFF ⇒ every R4 hook below is
+        # a no-op and the engine behaves exactly like Rev 3 (hard rule).
+        from .politics import PoliticsConfig as _PC, WorldRng as _WR
+        self.politics = politics if isinstance(politics, _PC) else _PC()
+        self.rng = _WR(world_seed, world_id)
+        # faction registry per civilization (created lazily on first turn
+        # with politics enabled; empty while disabled)
+        self.factions: dict[str, list] = {}
+        # conspiracy events history (chronicle facts; rolls live in snapshots)
+        self.conspiracies: list = []
+        # §22.5 resurfacing queue ("скрытая правда"): chronicle items the
+        # court chronicler censored in past turns reappear later — as tax
+        # arrears, rumors, belated notices.  Server-side memory; drained
+        # into the NEXT turn's narrative (§22.5, TASK-076).
+        self.suppressed_chronicle: list[dict] = []
+        # per-civ charged law-change costs of the CURRENT turn, recorded in
+        # the admin-cost step so step 17a can derive this interval's tax
+        # pressure (extraction felt by the elites, §22.3).
+        self._charged_costs_by_civ: dict[str, list[float]] = {}
+        # Rev 4: hidden Fortune rolls of civilizations that submitted no legal
+        # snapshot this turn — they still strike (§22.1), so their raw rolls
+        # are kept here for the admin audit / chronicle projection.
+        self._orphan_fortune_rolls: list = []
+        # last finalized TurnReport (Rev 4 audit consumers: admin endpoint)
+        self.last_report: "TurnReport | None" = None
         # Folklore corpus (§11.5): spread/mutation scale with GAME time only.
         self.folklore: list[FolkloreItem] = []
         # Prejudices (§13 step 15): long-lived social biases scaled by game time.
@@ -393,6 +431,40 @@ class TurnEngine:
             return rid is not None and rid in applied_set
 
         # Steps 8–10: time-scaled systems (§11.1–11.3).
+        # --- Rev 4 step 13a (BEFORE the economy so shocks hit production of
+        # THIS interval, §22.6): hidden Fortune rolls per civilization.
+        # Rolls run for EVERY active civilization — not only those that
+        # submitted a legal snapshot this turn: Fortune strikes fields and
+        # plagues cities whether or not the throne decreed anything (§22.1).
+        # No-op while politics.enabled=false ⇒ Rev-3 pipeline untouched.
+        fortune_impacts: dict[str, dict[str, float]] = {}
+        if self.politics.enabled:
+            from .fortune import roll_fortune
+            rolled_for: set[str] = set()
+            for snap in self._snapshot_list:
+                civ = self.civilizations.get(snap.civilization_id)
+                if civ is None or not civ.active or civ.id in rolled_for:
+                    continue
+                rolled_for.add(civ.id)
+                kinds = {l.canonical.kind for l in snap.active_laws
+                        if l.canonical is not None}
+                statecraft = civ.ruler.statecraft if civ.ruler else 0.0
+                rolls, impacts = roll_fortune(
+                    self.rng, turn.number, civ.id, statecraft, kinds,
+                    self.politics.fortune)
+                snap.fortune_rolls.extend(rolls)          # server-side only
+                fortune_impacts[civ.id] = impacts
+            # civilizations without a snapshot this turn still draw Fortune
+            for cid, civ in self.civilizations.items():
+                if not civ.active or cid in rolled_for:
+                    continue
+                statecraft = civ.ruler.statecraft if civ.ruler else 0.0
+                rolls, impacts = roll_fortune(
+                    self.rng, turn.number, cid, statecraft, set(),
+                    self.politics.fortune)
+                self._orphan_fortune_rolls.extend(rolls)  # admin audit only
+                fortune_impacts[cid] = impacts
+
         economy: dict[str, dict[str, float]] = {}
         for civ in self.civilizations.values():
             prod = production_this_turn(civ.annual_production_rate, span)
@@ -417,6 +489,59 @@ class TurnEngine:
                 if law.status in (LawStatus.ACTIVE, LawStatus.IN_TRANSITION):
                     law.age_years += span.years
                     law.tradition += tradition_gain(0.002, span)
+
+        # --- Rev 4 step 8a (§22.3 TASK-073): risk-premium decay driven by
+        # stability_years; long calm cheapens capital, cheap capital breeds
+        # interlinked investment — complexity grows, resilience falls, so a
+        # Fortune shock later costs more. Plus §22.1-5 shock application:
+        # impacts of THIS turn's adverse rolls damp production/population.
+        # No-op while politics is disabled (Rev-3 identity, §22.9-3).
+        if self.politics.enabled:
+            from .chronology import risk_premium_value
+            eq = self.politics.equilibrium
+            for civ in self.civilizations.values():
+                if not civ.active:
+                    continue
+                edits_this_turn = any(
+                    snap.civilization_id == civ.id
+                    and (snap.pending_amendments or snap.pending_repeals)
+                    for snap in self._snapshot_list)
+                repeals_this_turn = any(
+                    snap.civilization_id == civ.id and snap.pending_repeals
+                    for snap in self._snapshot_list)
+                if repeals_this_turn:
+                    civ.stability_years = 0.0     # repeal resets fully (§22.3)
+                elif edits_this_turn:
+                    civ.stability_years *= 0.5    # an edit partially resets
+                else:
+                    civ.stability_years += span.years
+                civ.risk_premium = risk_premium_value(
+                    civ.stability_years, eq.risk_base, eq.tau_law)
+                # cheap capital → investment → interlinking (§22.3)
+                invest = (1.0 - civ.risk_premium) * eq.complexity_investment_gain \
+                    * span.years
+                civ.complexity = max(1.0, civ.complexity + invest * civ.progress)
+                civ.resilience = 1.0 / civ.complexity
+                # apply Fortune shocks of this interval, scaled by fragility
+                impacts = fortune_impacts.get(civ.id, {})
+                prod_hit = impacts.get("production", 0.0)
+                if prod_hit:
+                    hit = prod_hit * prod * (2.0 - civ.resilience)
+                    economy[civ.id]["production"] = max(0.0, prod - hit)
+                    economy[civ.id]["shock_damage"] = round(hit, 4)
+                pop_hit = impacts.get("population", 0.0)
+                if pop_hit:
+                    loss = pop_hit * civ.population * (2.0 - civ.resilience)
+                    civ.population = max(1.0, civ.population - loss)
+                    economy[civ.id]["population_after"] = civ.population
+                    economy[civ.id]["shock_population_loss"] = round(loss, 4)
+                unrest = impacts.get("unrest", 0.0)
+                if unrest:
+                    civ.militarization = min(1.0, civ.militarization + unrest * 0.1)
+                if impacts.get("folklore"):
+                    for item in self.folklore:
+                        if item.civilization_id == civ.id:
+                            item.spread = min(1.5, item.spread + 0.05 * span.years * 0.1)
 
         # Step 16/§11.6–11.8: tick all timed effects in GAME time.
         # Treaties, law transitions and travel (§11.6, §11.7, §11.8) all
@@ -582,6 +707,32 @@ class TurnEngine:
             for p in self.prejudices
         }
 
+        # --- Rev 4 steps 17a/17b (§22.2, §22.3; TASK-071/072/075): elites,
+        # conspiracies with mechanical succession, equilibrium revert and
+        # ву-вэй accumulation. Runs after step 17 (war outcomes feed elite
+        # grievance) and before the chronicle is assembled. Entirely gated
+        # by politics.enabled — while it is off nothing below runs and the
+        # pipeline stays byte-identical to Rev 3 (§22.9-3).
+        # NOTE on ordering: run_turn() applies the snapshot's revisions
+        # FIRST (step 7+12), so by this point every charged cost of the
+        # interval is already known from the prices computed at snapshot
+        # time (§5.1 preview = charge). We record them here for step 17a's
+        # tax-pressure proxy.
+        politics_out: dict = {}
+        if self.politics.enabled:
+            charged: dict[str, list[float]] = {}
+            for snap in self._snapshot_list:
+                for rev in snap.pending_amendments + snap.pending_repeals:
+                    if rev.id in failed:
+                        continue      # §3.4: a Failed revision is never paid
+                    c = rev.cost if rev.cost is not None else cost_of_law_change(
+                        self.store.get_law(rev.law_id), rev.action,
+                        cfg=self.pricing_cfg)
+                    if c > 0.0:
+                        charged.setdefault(snap.civilization_id, []).append(c)
+            self._charged_costs_by_civ = charged
+            politics_out = self._run_politics_step(turn, span, economy)
+
         # TASK-068 (§ language design): advance the koine/dialect tree.
         # Drift, road growth and unification all scale with the turn's
         # GAME-time span — a 40-year ancient turn reshapes speech far more
@@ -692,6 +843,26 @@ class TurnEngine:
             language_events=lang_events,
             notices=notices,
             expired_effect_details=expired_details,
+            # --- Rev 4 (§22.6): political layer outputs. While politics is
+            # disabled everything below stays at its empty default and the
+            # report is byte-identical to a Rev-3 one (§22.9-3).
+            politics_active=self.politics.enabled,
+            elites=(politics_out.get("public", {}).get("elites_by_civ", {})
+                    if self.politics.enabled else {}),
+            conspiracies=(politics_out.get("public", {}).get("conspiracies", [])
+                          if self.politics.enabled else []),
+            rulers=(politics_out.get("public", {}).get("rulers", [])
+                    if self.politics.enabled else []),
+            hidden_audit={
+                "charged_costs": {cid: sum(v) for cid, v in
+                                  self._charged_costs_by_civ.items()},
+                **({
+                    "elite_deltas": politics_out.get("hidden", {}).get("elite_deltas", {}),
+                    "conspiracy_audit": politics_out.get("hidden", {}).get("conspiracy_audit", {}),
+                    "successions": politics_out.get("hidden", {}).get("successions", []),
+                    "rng": self.rng.snapshot_state(turn.number),
+                } if self.politics.enabled else {}),
+            },
         )
 
         # §19.1: build the turn chronicle ("events for the interval") BEFORE
@@ -703,10 +874,105 @@ class TurnEngine:
         report.events = [e.to_json() for e in
                          interval_events(report, turn.world_year_before)]
 
+        # --- Rev 4 steps 19a/19b (§22.5, TASK-076): Fortune consequences and
+        # conspiracy facts join the CHRONICLE as public events (no numbers),
+        # then the court chronicler distorts the narrative copy while the
+        # canonical list stays honest (§22.5 hard contract).
+        if self.politics.enabled:
+            canon_start = len(report.events)
+            # every active civ's successful adverse rolls join the chronicle,
+            # whether they were carried on a legal snapshot or rolled for a
+            # civ that decreed nothing this turn (§22.1)
+            all_rolls: list[tuple[str, object]] = []
+            for snap in self._snapshot_list:
+                for roll in snap.fortune_rolls:
+                    all_rolls.append((snap.civilization_id, roll))
+            for roll in self._orphan_fortune_rolls:
+                all_rolls.append((roll.civ_id or "", roll))
+            self._orphan_fortune_rolls = []
+            for cid, roll in all_rolls:
+                if not roll.success:
+                    continue
+                entry = dict(roll.to_event_json())
+                entry["civilization_id"] = cid
+                entry["year"] = round(self.chronology.current_year, 2)
+                entry["canonical"] = True
+                # adverse rolls that struck are recorded honestly here;
+                # distortion happens only in the narrative projection
+                entry["_severity"] = roll.severity   # stripped below
+                report.events.append(entry)
+            for ev_json in report.conspiracies:
+                ce = dict(ev_json)
+                ce["title"] = ("Свержение правителя" if
+                               ce.get("outcome") == "ruler_overthrown"
+                               else "Заговор раскрыт")
+                ce["detail"] = (f"{ce['instigator']}: {ce['outcome']}")
+                ce["year"] = ce.get("year", self.chronology.current_year)
+                ce["canonical"] = True
+                report.events.append(ce)
+            # resurfacing suppressed truth (§22.5 «скрытая правда»): censored
+            # items from earlier turns reappear now — late, but honest.
+            drained = self.suppressed_chronicle[:2]
+            self.suppressed_chronicle = self.suppressed_chronicle[2:]
+            for old in drained:
+                item = dict(old)
+                item["title"] = f"[Позднее сообщение] {item.get('title', '')}"
+                item["detail"] = (item.get("detail", "") +
+                                  " Истина проступает сквозь молчание летописи.").strip()
+                item["resurfaced"] = True
+                item["canonical"] = True
+                report.events.append(item)
+            # split canonical / narrative copies: the CANONICAL chronicle
+            # (admin/audit, hidden_audit) keeps every fact with its honest
+            # title; the public `report.events` gets the court's version.
+            canonical_events = []
+            for e in report.events:
+                ce = {k: v for k, v in e.items() if k != "_severity"}
+                ce["canonical"] = True
+                ce.pop("narrative", None)
+                canonical_events.append(ce)
+            new_items = [{k: v for k, v in e.items() if k != "_severity"}
+                         for e in report.events[canon_start:]]
+            base_items = report.events[:canon_start]
+            # per-civ grievance average feeds the flattery bias (§22.5)
+            avg_g = politics_out.get("avg_grievance", {})
+            mean_g = (sum(avg_g.values()) / len(avg_g)) if avg_g else 0.0
+            distorted_new, audit_new = distort_chronicle(
+                new_items,
+                next((c.ruler for c in self.civilizations.values()
+                      if c.active and c.ruler is not None), None),
+                mean_g, self.politics.report)
+            report.events = base_items + distorted_new
+            report.fortune_events = [
+                {k: v for k, v in e.items() if not k.startswith("_")}
+                for e in new_items if e.get("kind") == "FortuneEvent"]
+            # censorship buries some adverse news THIS turn — it goes to the
+            # suppression queue and resurfaces later (§22.5 resurface rule)
+            self.suppressed_chronicle.extend(audit_new.get("suppressed", []))
+            report.narrative_distortion = {
+                "applied": audit_new.get("applied", False),
+                "fields": audit_new.get("fields", []),
+                "suppressed_count": len(audit_new.get("suppressed", [])),
+                "bias": audit_new.get("bias", 0.0),
+                "censorship": audit_new.get("censorship", 0.0),
+            }
+            report.hidden_audit["canonical_events"] = canonical_events
+            report.hidden_audit["suppressed"] = audit_new.get("suppressed", [])
+
         # Steps 19–20 (§13): generate client representations from the finalized
         # report, then queue chronicle illustration tasks derived from them.
         report.view = build_turn_view(
             report, self.chronology, list(self.civilizations.values()))
+
+        # Rev 4: ship the public political projections inside the client view
+        # too (bands/facts only — exact loyalty/grievance/rolls never leave
+        # the server, §22.8, test §22.9-2).
+        if self.politics.enabled:
+            report.view["politics"] = {
+                "elites": report.elites,
+                "conspiracies": report.conspiracies,
+                "rulers": report.rulers,
+            }
 
         # §13 step 22: wrap the published numbers into the ruler's literary
         # turn report — wars, breakthroughs, discoveries, unrest, lawcraft —
@@ -754,9 +1020,137 @@ class TurnEngine:
         self.image_queue.extend(tasks)
         report.image_tasks = [t.to_json() for t in tasks]
 
+        # Rev 4 audit consumers (admin raw endpoint) read the last finalized
+        # report including hidden_audit / canonical chronicle (§22.6 step 21).
+        self.last_report = report
         return report
 
     # ------------------------------------------------------------- internals
+
+    def _run_politics_step(self, turn: Turn, span: SimDuration,
+                           economy: dict) -> dict:
+        """Rev 4 steps 17a/17b (§22.2–22.3): elites → conspiracy → equilibrium.
+
+        Returns a bundle consumed by the TurnReport (public projections +
+        server-side hidden audit). Deterministic in every input: same seed,
+        same laws, same spans ⇒ same rolls and successions (§22.9-1).
+        """
+        from . import elites as EL
+        from .distortion import distort_chronicle
+
+        cfg = self.politics
+        year = self.chronology.current_year
+        out_public: dict[str, list] = {"elites": [], "conspiracies": [],
+                                       "rulers": []}
+        hidden: dict = {"elite_deltas": {}, "conspiracy_audit": {},
+                        "successions": []}
+        avg_grievance: dict[str, float] = {}
+        elites_by_civ: dict[str, list] = {}
+
+        for civ_id, civ in self.civilizations.items():
+            if not civ.active:
+                continue
+            if civ.ruler is None:
+                civ.ruler = EL.ensure_ruler(civ_id, civ.name, year)
+            if civ_id not in self.factions:
+                self.factions[civ_id] = EL.form_factions(
+                    civ_id, civ.economy_profile)
+            factions = self.factions[civ_id]
+
+            # tax pressure proxy: effective extraction this interval.
+            # The admin budget spent on decrees IS the extraction felt by
+            # the elites; normalized against annual production it becomes
+            # civ.tax_load (0..1), which then persists between turns and
+            # reverts to its centre in step 17b (§22.3 equilibrium).
+            prod = economy.get(civ_id, {}).get("production", 0.0)
+            spent = sum(self._charged_costs_by_civ.get(civ_id, []))
+            load_now = min(1.0, spent / max(prod, 1e-9)) if prod > 0 else 0.0
+            civ.tax_load = max(civ.tax_load, load_now)   # shocks spike it now
+            deltas = EL.update_factions(factions, civ.ruler, span.years,
+                                        civ.tax_load, cfg)
+            hidden["elite_deltas"][civ_id] = deltas
+
+            # cruelty decays slowly; fresh cruelty still protects the throne
+            civ.ruler.cruelty_accumulator = max(
+                0.0, civ.ruler.cruelty_accumulator
+                - cfg.elite.cruelty_decay_per_year * span.years)
+            EL.drift_style(civ.ruler, factions, span.years, cfg)
+
+            # §22.3 ву-вэй: a quiet turn (no legal edits) accumulates dao
+            # power and calms elite nerves — conspiracy pressure is reduced.
+            edits_this_turn = any(
+                snap.civilization_id == civ_id
+                and (snap.pending_amendments or snap.pending_repeals)
+                for snap in self._snapshot_list)
+            wuwei_bonus = 0.0
+            if not edits_this_turn:
+                civ.ruler.dao_balance += cfg.equilibrium.dao_wuwei_per_year \
+                    * (1.0 + civ.stability_years / max(cfg.equilibrium.tau_law, 1.0)) \
+                    * span.years
+                wuwei_bonus = min(0.5, civ.ruler.dao_balance)
+
+            # statecraft grows from balanced rule: low grievance average and
+            # moderate aggregates earn prudence (§22.1-4 «добродетель»)
+            g_avg = (sum(f.grievance for f in factions) / len(factions)
+                     if factions else 0.0)
+            avg_grievance[civ_id] = g_avg
+            if g_avg < 0.35 and abs(civ.militarization - 0.15) < 0.3:
+                civ.ruler.statecraft = min(
+                    1.0, civ.ruler.statecraft
+                    + 0.001 * span.years * (1.0 + civ.ruler.dao_balance))
+
+            # --- step 17a: conspiracy check ---------------------------------
+            pressure = EL.conspiracy_pressure(factions, cfg.conspiracy.threshold)
+            pressure -= wuwei_bonus * 0.2          # quiet rule soothes plotters
+            if pressure > 0.0:
+                res = EL.resolve_conspiracy(
+                    self.rng, turn.number, civ_id, civ.ruler, factions,
+                    pressure, year, cfg)
+                ev, audit = res[0], res[1]
+                new_ruler = res[2] if len(res) > 2 else None
+                if ev is not None:
+                    self.conspiracies.append(ev)
+                    hidden["conspiracy_audit"][ev.id] = audit
+                    out_public["conspiracies"].append(ev.to_chronicle_json())
+                    if new_ruler is not None:
+                        # mechanical succession: civ & laws survive, ruler
+                        # changes; player has NO API to pick an heir (#2)
+                        civ.ruler = new_ruler
+                        hidden["successions"].append({
+                            "civ_id": civ_id, "new_ruler": new_ruler.name,
+                            "origin": new_ruler.origin_faction})
+                        # treasury confiscation feeds the admin budget loss
+                        civ.administrative_budget *= 0.7
+
+            # --- step 17b: equilibrium revert of extreme aggregates ---------
+            eq = cfg.equilibrium
+            for attr, center in eq.centers.items():
+                civ.revert_toward(attr, center, eq.revert_rate, span.years)
+            # modesty: loud display taxes merchants/artisans indirectly (§22.3)
+            modesty_line = eq.modesty_threshold_scale * max(civ.progress, 0.05)
+            if civ.prestige_display > modesty_line:
+                over = civ.prestige_display - modesty_line
+                for f in factions:
+                    if f.name in ("merchants", "artisans"):
+                        f.grievance = min(1.0, f.grievance + over * 0.1 * span.years * 0.02)
+
+            pub_factions = [dict(f.to_public_json(), civilization_id=civ_id)
+                            for f in factions]
+            out_public["elites"].extend(pub_factions)
+            elites_by_civ[civ_id] = pub_factions
+            style = civ.ruler.style
+            band = ("tyrannic" if style > 0.5 else
+                    "hard-handed" if style > 0.15 else
+                    "liberal" if style < -0.15 else "moderate")
+            out_public["rulers"].append({
+                "civilization_id": civ_id, "name": civ.ruler.name,
+                "style_band": band,               # range, never exact number
+                "public_virtues": round(civ.ruler.statecraft, 2),
+                "canonical": True})
+
+        return {"public": {**out_public, "elites_by_civ": elites_by_civ},
+                "hidden": hidden,
+                "avg_grievance": avg_grievance}
 
     def _language_fragmentation(self, civ_id: str) -> float:
         """TASK-068: how poorly decrees travel through one civilization.

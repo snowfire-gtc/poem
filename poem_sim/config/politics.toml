@@ -1,0 +1,45 @@
+# Rev 4 configuration: political philosophy layer (§22.7, TASK-077a).
+# THE HARD RULE: with enabled=false the engine behaves EXACTLY like Rev 3.
+
+[politics]
+enabled = false          # master switch for all Rev-4 mechanics
+
+[politics.fortune]       # §22.1 hidden rolls; virtue tempers Fortune
+p_min = 0.02
+p_max = 0.60
+k_virtue = 0.5           # p_eff = clamp(p_base·(1 − k·statecraft), p_min, p_max)
+shock_damage_scale = 0.35
+damper_strength = 0.4    # insurance/granary/commons laws cut amplitude (§22.1-5)
+
+[politics.elite]         # §22.2.2 loyalty/grievance dynamics (per game-year)
+grievance_tax_rate = 0.010
+loyalty_stability_gain = 0.004
+ambition_power_gain = 0.002
+fear_capacity_scale = 0.5        # fear suppresses grievance only up to ∝ power
+cruelty_hostile_threshold = 0.8  # past it factions turn irreversibly hostile
+cruelty_decay_per_year = 0.01
+style_drift_per_year = 0.002     # elites push ruler.style (§22.2.4)
+
+[politics.conspiracy]    # §22.2.3 — frequency calibrated via threshold (§22.10)
+threshold = 0.35
+base_ignition_p = 0.25
+success_mod_statecraft = 0.4
+fresh_cruelty_protection = 0.3
+
+[politics.equilibrium]   # §22.3 даосская стабилизация
+revert_rate = 0.01       # x' = x + (center − x)·rate·Δyears (step 17b)
+tau_law = 80.0           # risk-premium decay constant, game years
+risk_base = 0.30
+complexity_investment_gain = 0.0015
+dao_wuwei_per_year = 0.003       # ву-вэй accumulation on quiet turns
+modesty_threshold_scale = 0.5    # × civ progress → prestige penalty line
+
+[politics.equilibrium.centers]
+militarization = 0.15
+tax_load = 0.25
+prestige_display = 0.2
+
+[politics.report]        # §22.5 flattery / censorship / self_deception
+flattery_scale = 0.5
+censorship_level = 0.6
+self_deception_gain = 0.004
