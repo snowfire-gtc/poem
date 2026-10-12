@@ -122,3 +122,81 @@ def test_cli_refuses_open_server_without_token(monkeypatch):
     monkeypatch.delenv("POEM_ALLOW_OPEN_SERVER", raising=False)
     with pytest.raises(SystemExit):
         main(["--port", "0"])   # argparse.error → SystemExit(2)
+
+
+# ------------------------------------------------------------ static SPA (ui-client §8)
+
+@pytest.fixture()
+def static_server(tmp_path):
+    """Same server with a pre-built web client directory mounted at GET /."""
+    root = tmp_path / "web"
+    root.mkdir()
+    (root / "index.html").write_text("<!doctype html><title>Поэма</title>",
+                                     encoding="utf-8")
+    (root / "app.js").write_text("console.log(1);", encoding="utf-8")
+    ws = make_server(world_id="testworld", asset_dir=tmp_path, admin_token=TOKEN)
+    httpd = PoemHTTPServer(("127.0.0.1", 0), PoemHTTPRequestHandler, ws,
+                           static_dir=root)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    httpd.shutdown()
+    httpd.server_close()
+    t.join(timeout=5)
+
+
+def _raw_get(base, path):
+    req = urllib.request.Request(base + path, method="GET")
+    return urllib.request.urlopen(req)
+
+
+def test_static_index_served_at_root(static_server):
+    resp = _raw_get(static_server, "/")
+    body = resp.read().decode()
+    assert resp.status == 200
+    assert "Поэма" in body
+    assert "text/html" in resp.headers["Content-Type"]
+
+
+def test_static_asset_with_media_type(static_server):
+    resp = _raw_get(static_server, "/app.js")
+    assert resp.status == 200
+    assert "javascript" in resp.headers["Content-Type"]
+
+
+def test_static_traversal_is_blocked(static_server):
+    # %2e%2e decoding must not escape the static root → falls through to API 404
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _raw_get(static_server, "/%2e%2e/%2e%2e/etc/passwd")
+    assert exc.value.code == 404
+
+
+def test_api_routes_keep_priority_over_static(static_server):
+    # health probe and API GETs must not be shadowed by the SPA handler
+    payload = json.loads(_raw_get(static_server, "/healthz").read())
+    assert payload["status"] == "ok"
+    laws = json.loads(_raw_get(static_server, "/api/v1/laws").read())
+    assert laws["laws"] == []
+
+
+def test_static_missing_index_returns_503(tmp_path):
+    ws = make_server(world_id="w", asset_dir=tmp_path, admin_token=TOKEN)
+    httpd = PoemHTTPServer(("127.0.0.1", 0), PoemHTTPRequestHandler, ws,
+                           static_dir=tmp_path / "nonexistent-web")
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _raw_get(f"http://127.0.0.1:{httpd.server_address[1]}", "/")
+        assert exc.value.code == 503
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+def test_no_static_dir_means_api_only(server):
+    # default fixture has no static_dir: GET / is an unknown API route (404)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _raw_get(server, "/")
+    assert exc.value.code == 404

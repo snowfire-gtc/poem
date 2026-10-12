@@ -117,6 +117,41 @@ class PoemHTTPRequestHandler(BaseHTTPRequestHandler):
     def _headers_dict(self) -> dict:
         return {k: v for k, v in self.headers.items()}
 
+    # ---------------------------------------------------------- static SPA
+    def _try_static(self) -> bool:
+        """Serve the pre-built web client from ``server.static_dir``
+        (ui-client.md §8: «статика тем же сервером: GET / рядом с /api/v1»).
+
+        Same-origin hosting means no CORS and works air-gapped (no external
+        CDNs).  Returns True when this branch produced the response."""
+        root = getattr(self.server, "static_dir", None)
+        if not root:
+            return False
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/api/"):
+            return False                      # API routes keep priority
+        root = Path(root).resolve()
+        is_page = path in ("/", "")
+        if is_page:
+            target = root / "index.html"
+        else:
+            target = (root / path.lstrip("/")).resolve()
+            if not str(target).startswith(str(root) + "/"):
+                return False                  # traversal attempt → API 404
+        if target.is_file():
+            media = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+            if media.startswith("text/") or media in ("application/javascript",
+                                                      "application/json"):
+                media += "; charset=utf-8"
+            self._binary(200, target.read_bytes(), media)
+            return True
+        if is_page:
+            self._json(503, {"status": 503,
+                             "error": "web client build not found — run the SPA "
+                                      "bundler or use the REST API directly"})
+            return True
+        return False
+
     # --------------------------------------------------------- asset route
     def _try_asset_binary(self) -> bool:
         """Serve ``GET /api/v1/images/{id}/asset`` as raw bytes. Returns
@@ -151,6 +186,8 @@ class PoemHTTPRequestHandler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok",
                              "world": ws.chronology.world_id,
                              "turn": ws.chronology.current_turn})
+            return
+        if self._try_static():
             return
         if self._try_asset_binary():
             return
@@ -188,9 +225,12 @@ class PoemHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, handler_class, world_server: WorldServer):
+    def __init__(self, addr, handler_class, world_server: WorldServer,
+                 static_dir: str | Path | None = None):
         super().__init__(addr, handler_class)
         self.world_server = world_server
+        # ui-client.md §8: same-origin hosting of the pre-built SPA.
+        self.static_dir = static_dir
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -210,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--season", default=os.environ.get("POEM_SEASON"),
                         choices=[s.value for s in SeasonId],
                         help="first season of the world's year (alien calendars)")
+    parser.add_argument("--static-dir",
+                        default=os.environ.get("POEM_STATIC_DIR"),
+                        help="directory with the pre-built web client (SPA); "
+                             "served at GET / next to /api/v1 (ui-client §8)")
     parser.add_argument("--insecure-open-server", action="store_true",
                         help="allow serving without POEM_ADMIN_TOKEN (dev only)")
     args = parser.parse_args(argv)
@@ -230,10 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         season=args.season,
         admin_token=admin_token,
     )
-    httpd = PoemHTTPServer((args.host, args.port), PoemHTTPRequestHandler, ws)
+    httpd = PoemHTTPServer((args.host, args.port), PoemHTTPRequestHandler, ws,
+                           static_dir=args.static_dir)
     print(f"poem server listening on http://{args.host}:{args.port} "
           f"(world '{args.world_id}', "
-          f"auth={'admin token required' if admin_token else 'OPEN (dev)'})",
+          f"auth={'admin token required' if admin_token else 'OPEN (dev)'}, "
+          f"static={'on' if args.static_dir else 'off'})",
           flush=True)
     try:
         httpd.serve_forever()
