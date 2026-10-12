@@ -11,6 +11,15 @@ Modules:
  * poem.config      — TOML configuration loading & validation (§8, §14)
 """
 
+from .api import WorldServer  # noqa: F401
+from .chronology import (  # noqa: F401
+    Civilization,
+    TurnIntervalRule,
+    WorldChronology,
+    advance_chronology,
+    calculate_turn_span,
+    determine_world_era,
+)
 from .core import (  # noqa: F401
     CanonicalLaw,
     CanonicalLawChange,
@@ -36,25 +45,16 @@ from .core import (  # noqa: F401
     TurnLawSnapshot,
     TurnStatus,
 )
-from .chronology import (  # noqa: F401
-    Civilization,
-    TurnIntervalRule,
-    WorldChronology,
-    advance_chronology,
-    calculate_turn_span,
-    determine_world_era,
-)
 from .laws import LawStore  # noqa: F401
+from .pricing import PricingConfig, cost_of_law_change  # noqa: F401
+from .tokens import TOKEN_KINDS, TokenRegistry, VisualToken  # noqa: F401
+from .turn import DEFERRED_NOTICE, TurnEngine, TurnReport  # noqa: F401
 from .validation import (  # noqa: F401
     DEFAULT_VALIDATOR,
     LawValidator,
     ValidationResult,
     detect_kind,
 )
-from .pricing import PricingConfig, cost_of_law_change  # noqa: F401
-from .tokens import TOKEN_KINDS, TokenRegistry, VisualToken  # noqa: F401
-from .turn import DEFERRED_NOTICE, TurnEngine, TurnReport  # noqa: F401
-from .api import WorldServer  # noqa: F401
 
 __all__ = [
     "CanonicalLaw", "CanonicalLawChange", "CustomaryLaw", "DraftStatus", "Era",

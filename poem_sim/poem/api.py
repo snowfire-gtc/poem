@@ -17,8 +17,7 @@ import os
 import re
 import secrets
 import time
-from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -31,10 +30,9 @@ from .core import (
     GameSpeed,
     Law,
     LawRevisionStatus,
-    LawStatus,
     LawUserAction,
-    SimDuration,
     SeasonId,
+    SimDuration,
     TimedEffect,
     TimedEffectKind,
     War,
@@ -724,7 +722,7 @@ class WorldServer:
             "civilizations": [
                 {
                     "civilization_id": s.civilization_id,
-                    "active_laws": [l.id for l in s.active_laws],
+                    "active_laws": [law.id for law in s.active_laws],
                     "pending_amendments": [r.id for r in s.pending_amendments],
                     "pending_repeals": [r.id for r in s.pending_repeals],
                     "suspended_laws": list(s.suspended_laws),
@@ -773,9 +771,9 @@ class WorldServer:
         # time: after repeal the law is no longer administered. Without this
         # exclusion preview and charge drift by one bureaucracy step.
         active_laws = [
-            l for l in self.store.laws_of(law.civilization_id)
-            if l.status.value in ("active", "in_transition")
-            and not (action == LawUserAction.REPEAL_LAW and l.id == law.id)
+            other for other in self.store.laws_of(law.civilization_id)
+            if other.status.value in ("active", "in_transition")
+            and not (action == LawUserAction.REPEAL_LAW and other.id == law.id)
         ]
         cost = cost_of_law_change(
             law, action, cfg=self.engine.pricing_cfg,
@@ -805,7 +803,8 @@ class WorldServer:
         законами»): same-kind overlap, contradictory kind pairs, and — for a
         prospective REPEAL — dependency references from surviving laws.
         """
-        from .core import LawUserAction as _A, kinds_conflict
+        from .core import LawUserAction as _A
+        from .core import kinds_conflict
 
         count = 0
         for other in self.store.laws_of(law.civilization_id):
@@ -1041,7 +1040,7 @@ class WorldServer:
     def list_laws(self, path: str, body: dict) -> dict:
         civ = body.get("civilization_id")
         laws = self.store.laws_of(civ) if civ else list(self.store._laws.values())
-        return {"laws": [self._law_json(l) for l in laws]}
+        return {"laws": [self._law_json(law) for law in laws]}
 
     def get_law_detail(self, path: str, body: dict) -> dict:
         """GET /api/v1/laws/{id} — full client card (§16.2).
@@ -1123,12 +1122,12 @@ class WorldServer:
             "visual_tokens": law_tokens,
         }
 
-    def _law_json(self, l: Law) -> dict:
+    def _law_json(self, law: Law) -> dict:
         return {
-            "id": l.id, "civilization_id": l.civilization_id,
-            "title": l.title, "status": l.status.value,
-            "tradition": l.tradition, "age_years": l.age_years,
-            "raw_text": l.raw_text,
+            "id": law.id, "civilization_id": law.civilization_id,
+            "title": law.title, "status": law.status.value,
+            "tradition": law.tradition, "age_years": law.age_years,
+            "raw_text": law.raw_text,
         }
 
     def create_law(self, path: str, body: dict) -> dict:
@@ -1586,7 +1585,6 @@ def _revision_json(r) -> dict:
 
 
 # Register the REST table of §15.
-import re  # noqa: E402
 
 # NOTE: patterns are matched against the *leading slash* normalised path
 # (``_normalize_path`` always returns "/..."), so every anchor must start

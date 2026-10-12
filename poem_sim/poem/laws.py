@@ -80,7 +80,7 @@ class LawStore:
             raise LawStoreError(f"unknown law {law_id}") from None
 
     def laws_of(self, civilization_id: str) -> list[Law]:
-        return [l for l in self._laws.values() if l.civilization_id == civilization_id]
+        return [law for law in self._laws.values() if law.civilization_id == civilization_id]
 
     def replace_law(self, law: Law) -> None:
         if law.id not in self._laws:

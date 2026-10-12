@@ -51,7 +51,7 @@ except Exception:  # circular-import safety net
     if not TYPE_CHECKING:
         Civilization = object  # type: ignore[assignment,misc]
 
-from .core import Era, Settlement, Terrain, Dialect, TERRAIN_ISOLATION, SimDuration
+from .core import TERRAIN_ISOLATION, Dialect, Era, Settlement, SimDuration, Terrain
 
 # --- balance knobs ----------------------------------------------------------
 

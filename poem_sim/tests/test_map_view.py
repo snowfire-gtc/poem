@@ -67,7 +67,7 @@ def test_map_payload_shape():
     assert m["civilization_id"] == "c1"
     assert m["projection"] == "equirectangular"
     assert set(m["projections_available"]) == {"equirectangular", "mercator", "conic"}
-    layer_ids = [l["id"] for l in m["layers"]]
+    layer_ids = [lay["id"] for lay in m["layers"]]
     assert layer_ids == ["relief", "settlements", "borders", "knowledge"]
 
 
@@ -103,7 +103,7 @@ def test_default_civ_picked_without_explicit_param():
 # ---------------------------------------------------------------------------
 
 def _settle_layer(m):
-    return next(l for l in m["layers"] if l["id"] == "settlements")["items"]
+    return next(lay for lay in m["layers"] if lay["id"] == "settlements")["items"]
 
 
 def test_own_lands_described_in_detail():
@@ -162,7 +162,7 @@ def test_foreign_lands_hidden_beyond_the_word():
 
 def test_knowledge_markers_carry_myths_and_rumors():
     m = get_map(populated_server(), civilization_id="c1")
-    items = next(l for l in m["layers"] if l["id"] == "knowledge")["items"]
+    items = next(lay for lay in m["layers"] if lay["id"] == "knowledge")["items"]
     for it in items:
         if it["kind"] == "terra_incognita":
             assert it["text"].startswith("за пределом слова — ")

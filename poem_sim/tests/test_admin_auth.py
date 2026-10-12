@@ -22,7 +22,6 @@ from poem.api import (
     generate_admin_token,
 )
 from poem.chronology import Civilization
-from poem.core import CanonicalLaw
 
 DAY = datetime(2026, 10, 10, tzinfo=timezone.utc)
 ADMIN = "s3cr3t-admin-token"

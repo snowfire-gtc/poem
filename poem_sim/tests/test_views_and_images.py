@@ -28,7 +28,7 @@ from poem.core import (
 )
 from poem.laws import LawStore
 from poem.turn import TurnEngine
-from poem.views import build_turn_view, queue_image_tasks, render_dashboard_text
+from poem.views import render_dashboard_text
 
 DAY = datetime(2026, 10, 10, tzinfo=timezone.utc)
 
@@ -83,7 +83,7 @@ def test_view_includes_laws_economy_and_admin_costs():
 
     view = report.view
     assert rev.id in view["applied_revisions"]
-    law_entry = next(l for l in view["laws"] if l["id"] == "law-tax")
+    law_entry = next(lw for lw in view["laws"] if lw["id"] == "law-tax")
     assert law_entry["status"] == "active"
     assert law_entry["age_years"] == 25.0            # §11.4 scaled by game time
     assert view["admin_costs"]["c1"] > 0.0           # §5 charge surfaced to UI

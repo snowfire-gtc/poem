@@ -21,9 +21,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from poem.chronicle_report import build_ruler_report
 from poem.core import CanonicalLaw, CanonicalLawChange, LawUserAction
-from poem.llm import (LlmConfig, LlmTextProvider, LlmTransportError,
-                      build_prompt, get_default_provider, looks_safe,
-                      prompt_key, sanitize, set_default_provider)
+from poem.llm import (
+    LlmConfig,
+    LlmTextProvider,
+    LlmTransportError,
+    build_prompt,
+    get_default_provider,
+    looks_safe,
+    prompt_key,
+    sanitize,
+    set_default_provider,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_ruler_reports import make_rich_engine

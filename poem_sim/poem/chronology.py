@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .core import (
     Era,
@@ -21,6 +22,9 @@ from .core import (
     SimDuration,
     apply_speed_multiplier,
 )
+
+if TYPE_CHECKING:  # noqa: F401 — только для аннотаций (Rev 4, §22.7)
+    from .core import RulerState
 
 
 # ---------------------------------------------------------------------------

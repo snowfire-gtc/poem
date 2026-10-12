@@ -39,7 +39,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from poem.api import WorldServer
-from poem.chronology import Civilization, WorldChronology, risk_premium_value
+from poem.chronology import Civilization, risk_premium_value
 from poem.core import (
     CanonicalLaw,
     CanonicalLawChange,
@@ -51,7 +51,6 @@ from poem.core import (
 )
 from poem.distortion import distort_chronicle
 from poem.fortune import FORTUNE_EVENTS, damper_factor, roll_fortune
-from poem.laws import LawStore
 from poem.markets import MarketNiche
 from poem.politics import (
     PoliticsConfig,
@@ -59,7 +58,6 @@ from poem.politics import (
     load_politics_config,
     parse_politics_config,
 )
-from poem.turn import TurnEngine
 
 DAY = datetime(2026, 10, 10, tzinfo=timezone.utc)
 
@@ -493,7 +491,6 @@ def test_equilibrium_revert_rate():
         assert abs(civ.militarization - expected) < 1e-9
     assert civ.militarization < 0.95           # pulled toward the centre
     # modesty penalty: loud display irritates merchants/artisans (§22.3)
-    from poem.core import EliteFaction as EF
     factions = srv.engine.factions.setdefault("c1", [])
     if not factions:
         run_turns(srv, 1)

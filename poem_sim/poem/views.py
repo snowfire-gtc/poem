@@ -178,8 +178,8 @@ def interval_events(report, world_year_before: float) -> list:
     """
     from .core import (
         EVENT_INTERVAL_YEARS,
-        IntervalEvent,
         MIN_EVENT_SPAN_YEARS,
+        IntervalEvent,
         TimedEffectKind,
     )
 
@@ -329,7 +329,7 @@ def select_tokens_for_task(registry, task_payload: dict, view: dict,
                 add(tok)
 
     # 4. tokens cross-linked to laws / folklore present in this turn's view
-    law_ids = {l.get("id") for l in view.get("laws", [])}
+    law_ids = {lw.get("id") for lw in view.get("laws", [])}
     folk_ids = {f.get("folklore_id") for f in view.get("folklore", [])}
     for tok in registry.all():
         refs = set(tok.refs.values())
@@ -418,7 +418,7 @@ def queue_image_tasks(view: dict, world_id: str, registry=None) -> list[ImageTas
         hero.payload["token_ids"] = hero_tokens
     tasks: list[ImageTask] = [hero]
     for rev_id in view.get("applied_revisions", []):
-        law = next((l for l in view.get("laws", []) if l.get("id") == rev_id), None)
+        law = next((lw for lw in view.get("laws", []) if lw.get("id") == rev_id), None)
         civ_id = (law or {}).get("civilization_id")
         title = (law or {}).get("title") or rev_id
         payload = {"kind": "law_vignette", "revision_id": rev_id}

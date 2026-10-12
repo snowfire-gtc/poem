@@ -249,7 +249,7 @@ def test_submit_draft_via_revision_submit_endpoint():
                      {"canonical_draft": {"kind": "tax"}})
     assert upd["draft"]["status"] == "Validated"
 
-    sub = srv.handle("POST", f"/api/v1/laws/law-tax/revisions/new/submit",
+    sub = srv.handle("POST", "/api/v1/laws/law-tax/revisions/new/submit",
                      {"draft_id": draft_id,
                       "now": DAY.replace(hour=3).isoformat()})
     assert sub["status"] == 200

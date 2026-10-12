@@ -9,17 +9,16 @@ to renderers/clients.
 from __future__ import annotations
 
 import sys
-
-import pytest
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from poem.api import WorldServer
 from poem.chronology import Civilization
-from poem.core import (CanonicalLaw, CanonicalLawChange, Law, LawUserAction)
-
+from poem.core import LawUserAction
 
 DAY = datetime(2026, 10, 10, tzinfo=timezone.utc)
 
@@ -265,7 +264,6 @@ def test_asset_ref_traversal_is_rejected(tmp_path):
 
 def test_asset_not_ready_until_done(tmp_path):
     """GET asset on a queued task is a 400; failed tasks keep no asset."""
-    import base64 as b64
     srv, hero = _hero_after_turn(tmp_path)
     early = srv.handle("GET", f"/api/v1/images/{hero['id']}/asset")
     assert early["status"] == 400
