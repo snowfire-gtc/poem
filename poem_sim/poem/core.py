@@ -554,3 +554,146 @@ class TurnLawSnapshot:
     suspended_laws: list[LawId] = field(default_factory=list)
     customary_remnants: list[CustomaryLaw] = field(default_factory=list)
     conflicts: list[LawConflict] = field(default_factory=list)
+    # Rev 4 (§22.7): hidden Fortune rolls of this turn for this civ. They are
+    # server-side audit data ONLY — never serialized into a client payload
+    # (§22.1 rule 2; test §22.9-2). Admin raw endpoint may expose them.
+    fortune_rolls: list["FortuneRoll"] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Rev 4 (§22): political philosophy layer — «Государь» and «Дао Дэ Цзин».
+# All of it is inert while politics.enabled=false (behaviour identical to
+# Rev 3 — the hard backward-compatibility constraint, todo.md §Этап 1).
+# ---------------------------------------------------------------------------
+
+class Ideology(str, enum.Enum):
+    LIBERAL = "liberal"
+    AUTHORITARIAN = "authoritarian"
+    TRADITIONALIST = "traditionalist"
+
+
+#: Canonical elite orders from which factions are formed out of the economy
+#: (§22.2.1). Order matters only for deterministic iteration.
+ELITE_ORDERS: tuple[str, ...] = (
+    "clergy", "nobility", "merchants", "military", "scribes", "artisans",
+)
+
+
+@dataclass
+class RulerState:
+    """The ruling person of one civilization (§22.2.4, §22.7).
+
+    ``style`` is the hidden liberal↔tyrant axis (−1..+1); ``statecraft`` is
+    accumulated virtue that tempers Fortune (§22.1 p_eff formula);
+    ``cruelty_accumulator`` tracks repeated repression inside a window and
+    flips factions irreversibly hostile past its threshold (§22.2.2);
+    ``dao_balance`` grows through non-action (ву-вэй, §22.3).
+    """
+
+    name: str = ""
+    style: float = 0.0                 # −1 liberal .. +1 tyrant
+    statecraft: float = 0.0            # 0..1 accumulated virtue/prudence
+    cruelty_accumulator: float = 0.0   # fresh repressions, decays with time
+    dao_balance: float = 0.0           # accumulated «force of the Way»
+    self_deception: float = 0.0        # belief in one's own flattery (§22.5)
+    ascended_year: float = 0.0         # world year of coming to power
+    origin_faction: str | None = None  # faction that seated this ruler
+
+
+@dataclass
+class EliteFaction:
+    """One elite order of a civilization (§22.2.1).
+
+    power/wealth_stock/grievance are canonical server-side numbers; loyalty
+    and ambition are HIDDEN from ordinary clients (§22.8, test §22.9-2).
+    ``hostile`` is the irreversible state after the cruelty threshold.
+    """
+
+    id: str
+    civilization_id: CivilizationId
+    name: str                          # clergy/nobility/merchants/...
+    power: float = 0.0                 # normalized share among the factions
+    loyalty: float = 0.0               # −1..1 toward the current ruler
+    wealth_stock: float = 0.0          # accumulated economic weight
+    grievance: float = 0.0             # 0..1 accumulated resentment
+    ambition: float = 0.0              # hidden; grows with power
+    ideology: Ideology = Ideology.TRADITIONALIST
+    hostile: bool = False              # past the cruelty point of no return
+
+    def to_public_json(self) -> dict:
+        """Client-safe view: rough power band and position only — never the
+        exact loyalty/grievance/ambition numbers (§22.8)."""
+        if self.power >= 0.30:
+            band = "high"
+        elif self.power >= 0.15:
+            band = "medium"
+        else:
+            band = "low"
+        if self.hostile or self.loyalty <= -0.5:
+            position = "disaffected"
+        elif self.loyalty >= 0.4:
+            position = "loyal"
+        else:
+            position = "watchful"
+        return {"faction_id": self.id, "name": self.name,
+                "power_band": band, "position": position,
+                "ideology": self.ideology.value, "canonical": True}
+
+
+@dataclass
+class FortuneRoll:
+    """A single hidden Fortune roll of one turn (§22.1).
+
+    Raw values live in the server snapshot only; the client sees events,
+    never numbers (test §22.9-2). Deterministic: same seed ⇒ same rolls
+    (test §22.9-1).
+    """
+
+    event_id: str                      # e.g. "poor_harvest"
+    title: str                         # chronicle-ready subject
+    severity: float                    # 0..1 amplitude before dampers
+    roll_value: float                  # raw PRNG draw — hidden
+    threshold: float                   # effective probability — hidden
+    success: bool                      # did the event strike?
+    civ_id: str | None = None
+    detail: str = ""
+
+    def to_event_json(self) -> dict:
+        """Public chronicle projection: consequences only, no numbers."""
+        return {"kind": "FortuneEvent", "event_id": self.event_id,
+                "title": self.title, "detail": self.detail}
+
+
+@dataclass
+class ConspiracyOutcome(enum.Enum):
+    PLOT_DISCOVERED = "plot_discovered"    # suppressed before it ripened
+    RULER_OVERTHROWN = "ruler_overthrown"  # mechanical succession (§22.2.3)
+    PLOT_FAILED = "plot_failed"            # rose but was defeated
+
+
+@dataclass
+class ConspiracyEvent:
+    """Result of step 17a when conspiracy pressure plus a hidden roll ignite
+    a plot (§22.2.3). Details of the rolls stay server-side."""
+
+    id: str
+    civilization_id: CivilizationId
+    turn_number: int
+    instigator_faction: str
+    pressure: float                    # Σ power·max(0,−loyalty−threshold)
+    outcome: ConspiracyOutcome
+    new_ruler: str | None = None       # name, when succession happened
+    new_style: float | None = None
+    year: float = 0.0
+
+    def to_chronicle_json(self) -> dict:
+        """Public view: the fact of the plot/succession without the hidden
+        mechanics (§22.1 rule 2, decision: player faces fait accompli)."""
+        return {
+            "kind": "ConspiracyEvent",
+            "civilization_id": self.civilization_id,
+            "instigator": self.instigator_faction,
+            "outcome": self.outcome.value,
+            "new_ruler": self.new_ruler,
+            "year": round(self.year, 2),
+        }

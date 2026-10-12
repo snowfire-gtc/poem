@@ -179,6 +179,8 @@ class WorldServer:
         validator=None,
         admin_token: str | None = None,
         worker_token: str | None = None,
+        politics=None,                    # poem.politics.PoliticsConfig | None
+        world_seed: int = 0,              # §22.1 server-side RNG seed, never shipped
     ) -> None:
         # ``validator`` (TASK-066): pluggable server-side neural layer for
         # law-text validation; defaults to the deterministic local heuristic.
@@ -206,7 +208,9 @@ class WorldServer:
         # Published turn reports (§13 step 22); the client fetches the last one.
         self.published_reports: list[dict] = []
         self.engine = TurnEngine(
-            world_id, self.store, self.chronology, [], timed_effects=self.timed_effects
+            world_id, self.store, self.chronology, [],
+            timed_effects=self.timed_effects,
+            politics=politics, world_seed=world_seed,
         )
         # The engine rebinds its effects list when a turn finalises (it
         # replaces the list with survivors), so the server must always read
@@ -859,6 +863,18 @@ class WorldServer:
             "view": report.view,
             "image_tasks": report.image_tasks,
         }
+        # Rev 4 (§22.8): public political projections ship ONLY as bands and
+        # facts — hidden rolls/loyalty/grievance never enter this payload
+        # (they live in report.hidden_audit, admin endpoint only). While
+        # politics is off these keys stay empty ⇒ byte-identical Rev-3 JSON.
+        if report.politics_active:
+            result["politics"] = {
+                "elites": report.elites,
+                "conspiracies": report.conspiracies,
+                "rulers": report.rulers,
+                "fortune_events": report.fortune_events,
+                "narrative_distortion": report.narrative_distortion,
+            }
         self.published_reports.append(result)
         return result
 

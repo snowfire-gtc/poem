@@ -72,8 +72,15 @@ def make_server(
     season: str | None = None,
     admin_token: str | None = None,
     worker_token: str | None = None,
+    politics_config: str | Path | None = None,
+    world_seed: int | None = None,
 ) -> WorldServer:
-    """Build a ``WorldServer`` from explicit args / environment defaults."""
+    """Build a ``WorldServer`` from explicit args / environment defaults.
+
+    Rev 4 (§22.7/§22.1): ``politics_config`` points at a politics TOML
+    (a missing file means politics OFF ⇒ exact Rev-3 behaviour); the seed
+    may come from the POEM_WORLD_SEED env var and never reaches clients.
+    """
     kwargs: dict = {"asset_dir": asset_dir}
     if game_speed:
         kwargs["game_speed"] = GameSpeed(game_speed)
@@ -85,6 +92,17 @@ def make_server(
         kwargs["admin_token"] = admin_token
     if worker_token is not None:
         kwargs["worker_token"] = worker_token
+    # --- Rev 4 wiring ------------------------------------------------------
+    from .config import load_politics_config as _load_politics
+    pol_path = (politics_config or
+                os.environ.get("POEM_POLITICS_CONFIG") or
+                Path(__file__).resolve().parent.parent / "config" / "politics.toml")
+    kwargs["politics"] = _load_politics(pol_path)
+    seed = world_seed
+    if seed is None:
+        env_seed = os.environ.get("POEM_WORLD_SEED")
+        seed = int(env_seed) if env_seed else 0
+    kwargs["world_seed"] = seed
     return WorldServer(world_id, **kwargs)
 
 

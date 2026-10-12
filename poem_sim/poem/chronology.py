@@ -120,6 +120,43 @@ class Civilization:
     # the koine; low unity means dialect fragmentation and harder-to-enforce
     # laws. Driven by poem.language each turn in GAME time only (§20.4).
     language_unity: float = 0.9
+    # --- Rev 4 (§22.7): political philosophy layer -------------------------
+    # All defaults keep a Rev-3 world byte-identical while politics is off;
+    # the engine only mutates them when PoliticsConfig.enabled is true.
+    ruler: "RulerState | None" = None          # current ruling person
+    stability_years: float = 0.0               # §22.3 time without legal edits
+    risk_premium: float = 0.0                  # §22.3 entrepreneurs' premium
+    complexity: float = 1.0                    # §22.3 economic interlinking
+    resilience: float = 1.0                    # §22.3 = 1 / complexity
+    # Extreme aggregates under equilibrium revert (§22.3, step 17b).
+    militarization: float = 0.0                # 0..1
+    tax_load: float = 0.0                      # 0..1 effective extraction
+    prestige_display: float = 0.0              # §22.3 «витринная мудрость»
+    economy_profile: dict = field(default_factory=dict)  # sector shares→elites
+
+    def revert_toward(self, attr: str, center: float, rate: float,
+                      years: float) -> float:
+        """§22.3 equilibrium: x' = x + (center − x) · rate · Δyears.
+
+        Used by step 17b to pull extreme aggregates back to the centre —
+        «перегнувший ветвь ломает её». Pure game-time function; the wall
+        clock never enters (§20.4)."""
+        current = float(getattr(self, attr))
+        new = current + (center - current) * rate * years
+        setattr(self, attr, new)
+        return new
+
+
+def risk_premium_value(stability_years: float, risk_base: float,
+                       tau_law: float) -> float:
+    """§22.3 risk-premium decay: risk_base · exp(−t / τ_law).
+
+    The longer the key set of laws goes untouched, the less instability
+    entrepreneurs price into their calculations."""
+    import math
+    if tau_law <= 0.0:
+        return risk_base
+    return risk_base * math.exp(-stability_years / tau_law)
 
 
 PROGRESS_ERA_THRESHOLDS: list[tuple[float, Era]] = [

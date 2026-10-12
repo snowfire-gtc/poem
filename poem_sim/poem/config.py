@@ -1,9 +1,14 @@
-"""TOML configuration loading & validation for chronology (§8, TASK-065).
+"""TOML configuration loading & validation for chronology (§8, TASK-065)
+and politics (Rev 4, TASK-077a).
 
 Allows changing intervals/speeds without touching code:
 
     config = load_chronology_config("config/chronology.toml")
     chronology = build_chronology(config, world_id="w1")
+
+Rev 4 adds an independent ``politics`` section loaded from
+``config/politics.toml``. Its default is ``enabled = false``; while it is
+off, the engine behaves EXACTLY like Rev 3 (hard compatibility rule).
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from .chronology import (
     validate_chronology_config,
 )
 from .core import Era, EraSource, GameSpeed, SimDuration
+from .politics import PoliticsConfig, parse_politics_config
 
 
 @dataclass
@@ -98,3 +104,16 @@ def build_chronology(cfg: ChronologyConfig, world_id: str) -> WorldChronology:
             raise ChronologyConfigError(f"interval table missing era '{era.value}'") from None
     chrono.current_era = chrono.rule_for(chrono.current_era).era
     return chrono
+
+
+# ---------------------------------------------------------------------------
+# Rev 4: politics configuration (TASK-077a) — default OFF, exact Rev-3 engine
+# ---------------------------------------------------------------------------
+
+def load_politics_config(path: str | Path) -> PoliticsConfig:
+    """Read config/politics.toml; a missing file means 'politics off'."""
+    p = Path(path)
+    if not p.exists():
+        return PoliticsConfig(enabled=False)
+    with open(p, "rb") as fh:
+        return parse_politics_config(tomllib.load(fh))
