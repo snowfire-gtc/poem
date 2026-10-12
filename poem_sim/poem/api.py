@@ -359,6 +359,14 @@ class WorldServer:
     def handle(self, method: str, path: str, body: dict | None = None,
                headers: dict | None = None) -> dict:
         body = body or {}
+        # Query strings are part of REST routes (GET /laws?civilization_id=c1,
+        # guide_client.md §5.3): strip them before matching and fold the pairs
+        # into the handler input so both HTTP and library hosts behave alike.
+        if "?" in path:
+            path, _, query = path.partition("?")
+            from urllib.parse import parse_qsl
+            for key, value in parse_qsl(query):
+                body.setdefault(key, value)
         try:
             norm = _normalize_path(path)
             handler = _match_route(method.upper(), norm)

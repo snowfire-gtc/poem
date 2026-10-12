@@ -55,6 +55,7 @@ from .pricing import PricingConfig, cost_of_law_change  # noqa: F401
 from .tokens import TOKEN_KINDS, TokenRegistry, VisualToken  # noqa: F401
 from .turn import DEFERRED_NOTICE, TurnEngine, TurnReport  # noqa: F401
 from .api import WorldServer  # noqa: F401
+from .client import ApiError, HttpClient, LibraryClient  # noqa: F401
 
 __all__ = [
     "CanonicalLaw", "CanonicalLawChange", "CustomaryLaw", "DraftStatus", "Era",
@@ -68,4 +69,5 @@ __all__ = [
     "TOKEN_KINDS", "TokenRegistry", "VisualToken",
     "PricingConfig", "cost_of_law_change", "DEFERRED_NOTICE",
     "TurnEngine", "TurnReport", "WorldServer",
+    "ApiError", "HttpClient", "LibraryClient",
 ]

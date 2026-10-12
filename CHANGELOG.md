@@ -6,6 +6,15 @@
 ## [Unreleased]
 
 ### Добавлено
+- **Тонкий игровой клиент** (`poem/client.py`, guide_client.md §1/§5): два транспорта —
+  `LibraryClient` (in-process через `WorldServer.handle`) и `HttpClient` (stdlib `urllib`,
+  Bearer-токен, бинарная загрузка ассетов `/images/{id}/asset`). Полный набор операций:
+  хроника/отчёт, дашборд (§16.1, 5 обязательных строк + предупреждение о смене интервала
+  хода), цивилизации, законы (карточка, статусы, pending-корзины §15.3, снимок, cost_preview,
+  history), черновики (CRUD + валидация), правки (submit/cancel), ходы (open/run), дипломатия,
+  очередь иллюстраций с поллингом `wait_for_images`. Структурированные серверные ошибки
+  сохраняются дословно (`ApiError`, ui-client.md §6); сетевые сбои — `status=0, is_transport`.
+  Экспортируется из пакета `poem`. Тесты — `tests/test_client.py` (13 тестов, оба транспорта).
 - **Аутентификация администратора сервера** (`poem/api.py`, §15 security addendum): все
   изменяющие маршруты (`POST`/`PUT`/`DELETE`/`PATCH`) требуют токен из `POEM_ADMIN_TOKEN`;
   сравнение за постоянное время (`hmac.compare_digest`); ответы `401`/`403`; отдельный
